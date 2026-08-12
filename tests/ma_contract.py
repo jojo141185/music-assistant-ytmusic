@@ -71,6 +71,52 @@ REQUIRED_AUDIO_FORMAT_FIELDS: tuple[str, ...] = (
     "bit_rate",
 )
 
+# ``MediaType`` members the provider hands back or switches on. Podcast support
+# (issue #52) is built entirely on the last two, and the unit suite runs against
+# a stub, so pin them here before anything depends on them.
+REQUIRED_MEDIA_TYPE_MEMBERS: tuple[str, ...] = (
+    "ARTIST",
+    "ALBUM",
+    "TRACK",
+    "PLAYLIST",
+    "PODCAST",
+    "PODCAST_EPISODE",
+)
+
+# ``Podcast`` fields the provider sets.
+REQUIRED_PODCAST_FIELDS: tuple[str, ...] = (
+    "item_id",
+    "provider",
+    "name",
+    "provider_mappings",
+    "publisher",
+    "metadata",
+)
+
+# ``PodcastEpisode`` fields the provider sets. ``position`` and ``podcast`` are
+# mandatory upstream with no default, so a stub that gave them one would let a
+# parser that forgets either of them pass here and fail in production.
+REQUIRED_PODCAST_EPISODE_FIELDS: tuple[str, ...] = (
+    "item_id",
+    "provider",
+    "name",
+    "provider_mappings",
+    "position",
+    "podcast",
+    "duration",
+    "metadata",
+)
+
+# Resume state lives on the episode and is explicitly nullable upstream: the
+# docstring says None lets Music Assistant fall back to its own resume point.
+# The provider leaves both unset, because YouTube's anonymous responses carry
+# no reliable playback position, and that is only safe while None keeps its
+# meaning.
+NULLABLE_PODCAST_EPISODE_FIELDS: tuple[str, ...] = (
+    "fully_played",
+    "resume_position_ms",
+)
+
 # ``StreamDetails`` fields the provider sets, either as constructor arguments
 # or by assignment afterwards.
 REQUIRED_STREAM_DETAILS_FIELDS: tuple[str, ...] = (

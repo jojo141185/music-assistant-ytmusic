@@ -36,6 +36,8 @@ import pytest
 
 from music_assistant_models.enums import ContentType, MediaType
 
+from ytmusic_free import PODCAST_EPISODE_SPLITTER
+
 pytestmark = pytest.mark.live
 
 # Long-lived, extremely well-known videos. Several, so that a single takedown
@@ -199,6 +201,88 @@ def test_compatibility_mode_still_resolves_something_playable(provider):
     video_id, fmt = _resolve_first_available(provider, prefer_quality=False)
     assert fmt.get("url", "").startswith("http"), f"{video_id}: no usable stream url"
     assert fmt.get("vcodec") == "none", f"{video_id}: compatibility mode picked video"
+
+
+def test_podcasts_still_resolve_anonymously(provider):
+    """Issue #52: the whole podcast feature rests on anonymous access.
+
+    Search, show detail and episode detail all answer without an account today.
+    If YouTube ever gates any of them behind a sign-in, podcast support stops
+    working for most users of this provider and nothing offline would notice,
+    because every unit test feeds the parsers hand-written payloads.
+
+    Also pins the two field shapes that surprised us while building it: the
+    duration arrives spelled out in words rather than as a clock string, and
+    an episode's ``date`` holds a view count rather than a date.
+    """
+    ytmusicapi = pytest.importorskip("ytmusicapi", reason="needed to reach the podcast endpoints")
+    provider._ytmusic = ytmusicapi.YTMusic()
+
+    results = asyncio.run(provider.search("Lex Fridman", [MediaType.PODCAST], limit=3))
+    assert results.podcasts, (
+        "anonymous podcast search returned nothing. If this is the only podcast "
+        "test failing, YouTube may have put shows behind a sign-in."
+    )
+    podcast = results.podcasts[0]
+    assert not podcast.item_id.startswith("MPSP"), (
+        f"{podcast.item_id}: the MPSP browse prefix reached Music Assistant. "
+        "get_podcast will not accept that id."
+    )
+
+    episodes = []
+
+    async def _first_episodes():
+        async for episode in provider.get_podcast_episodes(podcast.item_id):
+            episodes.append(episode)
+            if len(episodes) >= 3:
+                break
+
+    asyncio.run(_first_episodes())
+    assert episodes, f"{podcast.item_id}: show resolved but yielded no episodes"
+    assert all(e.duration > 0 for e in episodes), (
+        "an episode came back with no duration. YouTube spells these in words "
+        '("3 hr 46 min"); check whether that format changed.'
+    )
+    assert all(PODCAST_EPISODE_SPLITTER in e.item_id for e in episodes)
+    assert all(e.podcast is not None for e in episodes)
+
+
+def test_live_podcast_episode_is_playable(provider):
+    """An episode is an ordinary video id, so the track stream path must carry it."""
+    ytmusicapi = pytest.importorskip("ytmusicapi", reason="needed to reach the podcast endpoints")
+    provider._ytmusic = ytmusicapi.YTMusic()
+    provider._yt_dlp_module = None
+    provider._prefer_quality = True
+
+    results = asyncio.run(provider.search("Lex Fridman", [MediaType.PODCAST], limit=3))
+    if not results.podcasts:
+        pytest.skip("anonymous podcast search returned nothing")
+
+    episode = None
+
+    async def _first_episode():
+        nonlocal episode
+        async for item in provider.get_podcast_episodes(results.podcasts[0].item_id):
+            episode = item
+            break
+
+    asyncio.run(_first_episode())
+    assert episode is not None
+
+    details = asyncio.run(
+        provider.get_stream_details(episode.item_id, MediaType.PODCAST_EPISODE)
+    )
+    assert details.item_id == episode.item_id, (
+        "StreamDetails must echo the id Music Assistant asked for, or it cannot "
+        "match the stream back to the queue item"
+    )
+
+    try:
+        status, body = _fetch_range(details.path)
+    except urllib.error.HTTPError as err:
+        pytest.fail(f"episode stream url answered HTTP {err.code}")
+    assert status in (200, 206)
+    assert len(body) > 0
 
 
 def test_radio_playlist_still_resolves_tracks(provider):

@@ -112,6 +112,8 @@ def _install_music_assistant_models() -> None:
         ALBUM = "album"
         TRACK = "track"
         PLAYLIST = "playlist"
+        PODCAST = "podcast"
+        PODCAST_EPISODE = "podcast_episode"
 
     class _ProviderFeature(str, Enum):
         SEARCH = "search"
@@ -123,6 +125,7 @@ def _install_music_assistant_models() -> None:
         LIBRARY_ALBUMS = "library_albums"
         LIBRARY_TRACKS = "library_tracks"
         LIBRARY_PLAYLISTS = "library_playlists"
+        LIBRARY_PODCASTS = "library_podcasts"
         RECOMMENDATIONS = "recommendations"
         LIBRARY_ARTISTS_EDIT = "library_artists_edit"
         LIBRARY_ALBUMS_EDIT = "library_albums_edit"
@@ -273,6 +276,23 @@ def _install_music_assistant_models() -> None:
         is_editable: bool = False
 
     @dataclass
+    class _Podcast(_BaseMediaItem):
+        publisher: str | None = None
+        total_episodes: int | None = None
+
+    @dataclass
+    class _PodcastEpisode(_BaseMediaItem):
+        # position and podcast are mandatory upstream with no default. Giving
+        # them defaults here would let a parser that forgets either of them pass
+        # the unit suite and fail against real Music Assistant, which is the
+        # class of drift tests/ma_contract.py exists to prevent.
+        position: int = None  # type: ignore[assignment]
+        podcast: object = None
+        duration: int = 0
+        fully_played: bool | None = None
+        resume_position_ms: int | None = None
+
+    @dataclass
     class _RecommendationFolder:
         item_id: str
         provider: str
@@ -285,6 +305,7 @@ def _install_music_assistant_models() -> None:
         albums: list = field(default_factory=list)
         tracks: list = field(default_factory=list)
         playlists: list = field(default_factory=list)
+        podcasts: list = field(default_factory=list)
 
     media_items.Album = _Album
     media_items.Artist = _Artist
@@ -294,6 +315,8 @@ def _install_music_assistant_models() -> None:
     media_items.MediaItemType = object
     media_items.MediaType = enums.MediaType
     media_items.Playlist = _Playlist
+    media_items.Podcast = _Podcast
+    media_items.PodcastEpisode = _PodcastEpisode
     media_items.ProviderMapping = _ProviderMapping
     media_items.RecommendationFolder = _RecommendationFolder
     media_items.SearchResults = _SearchResults

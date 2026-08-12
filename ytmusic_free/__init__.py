@@ -49,6 +49,8 @@ from music_assistant_models.media_items import (
     MediaItemType,
     MediaType,
     Playlist,
+    Podcast,
+    PodcastEpisode,
     ProviderMapping,
     RecommendationFolder,
     SearchResults,
@@ -148,7 +150,39 @@ SEARCH_FILTER_BY_TYPE = {
     MediaType.ALBUM: "albums",
     MediaType.TRACK: "songs",
     MediaType.PLAYLIST: "playlists",
+    MediaType.PODCAST: "podcasts",
 }
+
+# Podcast episode ids carry their show with them: "<podcastId>|<videoId>". Music
+# Assistant looks an episode up on its own, without the show for context, and
+# PodcastEpisode requires a podcast, so the id has to be enough to rebuild both.
+# Matches the official ytmusic provider's separator, and "|" cannot appear in a
+# YouTube id or playlist id. See issue #52.
+PODCAST_EPISODE_SPLITTER = "|"
+
+# Search returns a show as "MPSP" + its playlist id, while get_podcast expects
+# the bare playlist id. Strip on the way in so one id shape flows through.
+PODCAST_BROWSE_PREFIX = "MPSP"
+
+# Episodes per show. get_podcast pages beyond this, but a queue's worth of the
+# most recent episodes is what a browse is for, and every extra page is another
+# request against a service that rate-limits.
+PODCAST_EPISODE_LIMIT = 100
+
+# Shows and episodes change far more slowly than a mix does: a new episode
+# appears weekly at best, and the description and artwork essentially never
+# change. Same stale-while-revalidate treatment as playlist tracks.
+PODCAST_CACHE_TTL = 6 * 3600
+
+# "3 hr 46 min", "31 min", "1 hr". YouTube spells episode lengths in words
+# rather than the clock format used for tracks, so _parse_timestamp cannot read
+# them.
+DURATION_WORDS_RE = re.compile(
+    r"(?:(?P<hours>\d+)\s*(?:hours?|hrs?|h)\b)?\s*"
+    r"(?:(?P<minutes>\d+)\s*(?:minutes?|mins?|m)\b)?\s*"
+    r"(?:(?P<seconds>\d+)\s*(?:seconds?|secs?|s)\b)?",
+    re.IGNORECASE,
+)
 
 CONF_AUTH_TYPE = "auth_type"
 CONF_COOKIE = "cookie_header"
@@ -451,6 +485,75 @@ def _rank_audio_format(fmt: dict[str, Any], prefer_quality: bool) -> tuple[float
     acodec = str(fmt.get("acodec") or "").lower()
     is_aac = fmt.get("ext") == "m4a" or acodec.startswith(("mp4a", "aac"))
     return (1.0 if is_aac else 0.0, bitrate)
+
+
+def _parse_duration_words(value: Any) -> int | None:
+    """Seconds from a spelled-out duration like "3 hr 46 min".
+
+    Returns None when nothing numeric is found, so a caller can leave the
+    duration unset rather than claiming a track is zero seconds long.
+
+    Tracks report a clock string ("3:46") that ``_parse_timestamp`` reads;
+    podcast episodes report words instead, and the two are not interchangeable:
+    "3 hr 46 min" read as a clock is nonsense, and "3:46" read as words finds no
+    unit at all. Falls through to ``_parse_timestamp`` so either spelling works
+    whichever endpoint it came from.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    match = DURATION_WORDS_RE.match(text)
+    if match and any(match.groupdict().values()):
+        hours = int(match["hours"] or 0)
+        minutes = int(match["minutes"] or 0)
+        seconds = int(match["seconds"] or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            return total
+
+    return _parse_timestamp(text)
+
+
+def _episode_item_id(podcast_id: str, video_id: str) -> str:
+    """Build the composite id an episode is addressed by."""
+    return f"{podcast_id}{PODCAST_EPISODE_SPLITTER}{video_id}"
+
+
+def _split_episode_id(item_id: str) -> tuple[str, str]:
+    """Split "<podcastId>|<videoId>" into its parts.
+
+    A bare id with no separator is treated as the video id with no known show,
+    because that is what a hand-written or legacy id looks like and refusing it
+    outright would be less useful than resolving what we can.
+    """
+    podcast_id, sep, video_id = str(item_id).partition(PODCAST_EPISODE_SPLITTER)
+    if not sep:
+        return "", podcast_id
+    return podcast_id, video_id
+
+
+def _strip_podcast_browse_prefix(browse_id: str) -> str:
+    """Turn a search result's "MPSP<playlistId>" into the bare playlist id."""
+    return str(browse_id or "").removeprefix(PODCAST_BROWSE_PREFIX)
+
+
+def _description_text(value: Any) -> str | None:
+    """Read a description that may arrive as a string or a Description object.
+
+    ``get_podcast`` returns plain strings; ``get_episode`` returns ytmusicapi's
+    ``Description``, which stringifies to a repr rather than its text.
+    """
+    if value is None:
+        return None
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return text or None
+    if isinstance(value, str):
+        return value or None
+    return None
 
 
 def _normalize_artist_name(value: str) -> str:
@@ -1025,6 +1128,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     parsed_results.albums.append(self._parse_album(result))
                 elif result_type == "playlist" and MediaType.PLAYLIST in media_types:
                     parsed_results.playlists.append(self._parse_playlist(result))
+                elif result_type == "podcast" and MediaType.PODCAST in media_types:
+                    # A show arrives as "MPSP<playlistId>" here and as the bare
+                    # playlist id everywhere else; _parse_podcast strips it so
+                    # one id shape reaches Music Assistant.
+                    parsed_results.podcasts.append(self._parse_podcast(result))
                 elif (
                     result_type in ("song", "video")
                     and MediaType.TRACK in media_types
@@ -1355,6 +1463,103 @@ class YoutubeMusicFreeProvider(MusicProvider):
             playlist_tracks = await self.get_playlist_tracks(songs["browseId"])
             return playlist_tracks[:25]
         return []
+
+    # ------------------------------------------------------------------
+    # Podcasts (issue #52)
+    #
+    # Works without an account: search, show detail and episode detail all
+    # answer anonymously, and an episode is an ordinary YouTube video id, so the
+    # existing stream path carries the audio with no new code.
+    #
+    # Library sync is deliberately absent. get_library_podcasts and
+    # get_saved_episodes need auth, and declaring LIBRARY_PODCASTS without them
+    # would have Music Assistant sync a library we cannot read, which is exactly
+    # how issue #55 emptied people's libraries.
+    # ------------------------------------------------------------------
+
+    async def _fetch_podcast_obj(self, prov_podcast_id: str) -> dict[str, Any]:
+        """Fetch a show, accepting either the bare or MPSP-prefixed id."""
+        podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
+        try:
+            podcast_obj = await asyncio.to_thread(
+                self._ytmusic.get_podcast, podcast_id, limit=PODCAST_EPISODE_LIMIT
+            )
+        except Exception as err:
+            raise MediaNotFoundError(f"Podcast {prov_podcast_id} not found") from err
+        if not podcast_obj:
+            raise MediaNotFoundError(f"Podcast {prov_podcast_id} not found")
+        return podcast_obj
+
+    @use_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
+    async def get_podcast(self, prov_podcast_id: str) -> Podcast:
+        """Get full podcast details by id."""
+        podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
+        podcast_obj = await self._fetch_podcast_obj(podcast_id)
+        return self._parse_podcast(podcast_obj, podcast_id)
+
+    async def get_podcast_episodes(
+        self, prov_podcast_id: str
+    ) -> AsyncGenerator[PodcastEpisode, None]:
+        """Get the episodes of a podcast."""
+        podcast_id = _strip_podcast_browse_prefix(prov_podcast_id)
+        podcast_obj = await self._fetch_podcast_obj(podcast_id)
+        podcast = self._parse_podcast(podcast_obj, podcast_id)
+        for index, episode_obj in enumerate(podcast_obj.get("episodes") or [], start=1):
+            with suppress(InvalidDataError, KeyError, TypeError):
+                # "index" is None on every anonymous response measured, so the
+                # enumeration order is the only ordering available. Episodes
+                # come back newest first, which is the order a listener expects.
+                position = episode_obj.get("index") or index
+                yield self._parse_podcast_episode(episode_obj, podcast, position)
+
+    @use_cache(PODCAST_CACHE_TTL, allow_expired_cache=True)
+    async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
+        """Get a single podcast episode by its composite id."""
+        podcast_id, video_id = _split_episode_id(prov_episode_id)
+        if not video_id:
+            raise MediaNotFoundError(f"Episode {prov_episode_id} not found")
+        try:
+            episode_obj = await asyncio.to_thread(self._ytmusic.get_episode, video_id)
+        except Exception as err:
+            raise MediaNotFoundError(f"Episode {prov_episode_id} not found") from err
+        if not episode_obj:
+            raise MediaNotFoundError(f"Episode {prov_episode_id} not found")
+        # get_episode does not echo the video id back, and PodcastEpisode needs
+        # it to build its own item_id, so put it back from what we were asked.
+        episode_obj.setdefault("videoId", video_id)
+
+        # A PodcastEpisode must carry a Podcast. The id we were given holds the
+        # show, and the response names it too, so fall back to the response when
+        # a caller hands us a bare video id.
+        if not podcast_id:
+            author = episode_obj.get("author")
+            if isinstance(author, dict):
+                podcast_id = _strip_podcast_browse_prefix(author.get("id") or "")
+            podcast_id = podcast_id or _strip_podcast_browse_prefix(
+                episode_obj.get("playlistId") or ""
+            )
+        podcast = await self._podcast_for_episode(podcast_id, episode_obj)
+        return self._parse_podcast_episode(episode_obj, podcast)
+
+    async def _podcast_for_episode(self, podcast_id: str, episode_obj: dict) -> Podcast:
+        """Resolve the show an episode belongs to, degrading to a stub.
+
+        A failed show lookup must not make the episode unplayable, so fall back
+        to a minimal Podcast built from what the episode response already names.
+        """
+        if podcast_id:
+            try:
+                return await self.get_podcast(podcast_id)
+            except Exception as err:  # noqa: BLE001 - a stub podcast still plays
+                self.logger.debug(
+                    "could not resolve podcast %s for episode: %s", podcast_id, err
+                )
+        author = episode_obj.get("author")
+        name = author.get("name") if isinstance(author, dict) else None
+        return self._parse_podcast(
+            {"title": name or "Unknown Podcast"},
+            podcast_id or episode_obj.get("playlistId") or "unknown",
+        )
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
@@ -1768,14 +1973,24 @@ class YoutubeMusicFreeProvider(MusicProvider):
         return self._drop_ai_tracks(tracks, f"song radio for {video_id}")
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Return stream details for the given track.
+        """Return stream details for the given track or podcast episode.
 
         ``item_id`` may carry a trim window (``VIDEOID@start-end``): the bare
         video id is used to resolve the stream, and ffmpeg input args trim the
         audio to that window so unwanted intros/outros (e.g. end-card audio)
         don't play.
+
+        A podcast episode is addressed as ``PODCASTID|VIDEOID`` (issue #52).
+        Once the show is stripped off, an episode is an ordinary YouTube video
+        and resolves down exactly the same path as a track.
         """
-        video_id, start, end = _split_track_id(item_id)
+        # Strip into a separate name, never over item_id: Music Assistant
+        # correlates the returned StreamDetails back to the queue item by the id
+        # it asked for, so handing back the bare video id would break that link.
+        stream_id = item_id
+        if media_type == MediaType.PODCAST_EPISODE or PODCAST_EPISODE_SPLITTER in item_id:
+            _, stream_id = _split_episode_id(item_id)
+        video_id, start, end = _split_track_id(stream_id)
         stream_format = await self._get_stream_format(video_id)
         self.logger.debug(
             "Resolved stream format '%s' for track %s", stream_format.get("format"), video_id
@@ -2698,6 +2913,84 @@ class YoutubeMusicFreeProvider(MusicProvider):
         else:
             playlist.owner = self.name
         return playlist
+
+    def _parse_podcast(self, podcast_obj: dict, podcast_id: str | None = None) -> Podcast:
+        """Parse a YTM podcast dict into a Podcast model object.
+
+        ``podcast_id`` overrides whatever the payload carries, because the show
+        detail response does not repeat its own id and the search result spells
+        it as an ``MPSP``-prefixed browse id.
+        """
+        resolved_id = podcast_id or _strip_podcast_browse_prefix(
+            podcast_obj.get("podcastId") or podcast_obj.get("browseId") or ""
+        )
+        if not resolved_id:
+            raise InvalidDataError("Podcast is missing an ID")
+        podcast = Podcast(
+            item_id=resolved_id,
+            provider=self.instance_id,
+            name=podcast_obj.get("title") or "Unknown Podcast",
+            provider_mappings={
+                ProviderMapping(
+                    item_id=resolved_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                    url=f"{YTM_DOMAIN}/playlist?list={resolved_id}",
+                )
+            },
+        )
+        if description := _description_text(podcast_obj.get("description")):
+            podcast.metadata.description = description
+        author = podcast_obj.get("author") or podcast_obj.get("channel")
+        if isinstance(author, dict):
+            podcast.publisher = author.get("name")
+        elif isinstance(author, str):
+            podcast.publisher = author
+        if podcast_obj.get("thumbnails"):
+            podcast.metadata.images = self._parse_thumbnails(podcast_obj["thumbnails"])
+        if isinstance(episodes := podcast_obj.get("episodes"), list):
+            podcast.total_episodes = len(episodes)
+        return podcast
+
+    def _parse_podcast_episode(
+        self, episode_obj: dict, podcast: Podcast, position: int = 0
+    ) -> PodcastEpisode:
+        """Parse a YTM episode dict into a PodcastEpisode model object."""
+        video_id = episode_obj.get("videoId")
+        if not video_id:
+            raise InvalidDataError("Podcast episode is missing videoId")
+        item_id = _episode_item_id(podcast.item_id, video_id)
+        episode = PodcastEpisode(
+            item_id=item_id,
+            provider=self.instance_id,
+            name=episode_obj.get("title") or "Unknown Episode",
+            position=position,
+            podcast=podcast,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=item_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                    url=f"{YTM_DOMAIN}/watch?v={video_id}",
+                    audio_format=self._catalog_audio_format(),
+                )
+            },
+        )
+        if (duration := _parse_duration_words(episode_obj.get("duration"))) is not None:
+            episode.duration = duration
+        if description := _description_text(episode_obj.get("description")):
+            episode.metadata.description = description
+        if episode_obj.get("thumbnails"):
+            episode.metadata.images = self._parse_thumbnails(episode_obj["thumbnails"])
+        # Deliberately no release_date. The "date" key on an anonymous response
+        # holds a view count ("591K views"), not a date, on every episode of
+        # every show checked. Parsing it would either raise or, worse, land a
+        # nonsense date on the item.
+        #
+        # fully_played and resume_position_ms are also left unset: None tells
+        # Music Assistant to use its own resume point, which is better than us
+        # inventing one from a field YouTube does not give us anonymously.
+        return episode
 
     def _parse_thumbnails(self, thumbnails_obj: list[dict]) -> list[MediaItemImage]:
         """Convert YTM thumbnail list to MediaItemImage list."""

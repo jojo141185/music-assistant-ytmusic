@@ -206,7 +206,7 @@ Your cookie is stored by Music Assistant itself, in the encrypted provider confi
 
 | Feature | Without auth | With auth |
 |---------|:---:|:---:|
-| Search (tracks, albums, artists, playlists) | ✅ | ✅ |
+| Search (tracks, albums, artists, playlists, podcasts) | ✅ | ✅ |
 | Add by pasting a YouTube / YTM link | ✅ | ✅ |
 | Trim a video with `@start-end` timestamps | ✅ | ✅ |
 | Stream audio | ✅ | ✅ |
@@ -218,7 +218,12 @@ Your cookie is stored by Music Assistant itself, in the encrypted provider confi
 | Personalized recommendations | ❌ | ✅ |
 | Library editing (add/remove) | ❌ | ✅ |
 | Multiple accounts side by side | ✅ | ✅ |
-| Podcast support | ❌ | ❌ |
+| Podcasts: search, browse a show, play episodes | ✅ | ✅ |
+| Podcast library sync (subscriptions, saved episodes) | ❌ | ❌ |
+
+> **Podcasts.** Search for a show, open it to see its most recent episodes, and play them. This works without an account, since YouTube answers all three anonymously. Episode length comes from YouTube; playback position is tracked by Music Assistant itself, because YouTube does not report one anonymously.
+>
+> Syncing your subscribed shows and saved episodes into the library is **not** implemented. Those endpoints need authentication, and declaring the feature without a working implementation behind it would make Music Assistant sync a library the provider cannot read, which is how [#55](https://github.com/sproft/music-assistant-ytmusic/issues/55) emptied people's libraries. It is tracked in [#52](https://github.com/sproft/music-assistant-ytmusic/issues/52) as a second pass.
 
 ### Adding an arbitrary YouTube link
 
