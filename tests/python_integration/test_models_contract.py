@@ -103,20 +103,14 @@ def test_podcast_episode_exposes_the_fields_the_provider_sets(real_models):
     assert not missing, f"upstream PodcastEpisode lost fields the provider sets: {missing}"
 
 
-def test_podcast_episode_requires_position_and_podcast(real_models):
-    """Both are mandatory upstream, which is why the stub must not default them.
-
-    A stub kinder than reality would let a parser that omits either of these
-    pass the unit suite and fail in production. Same class of drift as the
-    invented ContentType.WEBM behind issue #41.
-    """
-    fields = {f.name: f for f in dataclasses.fields(real_models.media_items.PodcastEpisode)}
-    for name in ("position", "podcast"):
-        field = fields[name]
-        assert (
-            field.default is dataclasses.MISSING
-            and field.default_factory is dataclasses.MISSING
-        ), f"PodcastEpisode.{name} gained a default upstream; the stub can relax too"
+# Deliberately not asserted here: that ``position`` and ``podcast`` are
+# *mandatory* upstream. The source on the models repo's main branch declares
+# them without a default, but ``dataclasses.fields()`` on the released 1.1.186
+# reports ``position.default is None``, so an assertion written from the source
+# failed against the package users actually run. The provider sets both fields
+# explicitly on every episode it builds and the unit suite pins that, which is
+# the property worth protecting; how strict upstream chooses to be about it is
+# upstream's business.
 
 
 def test_podcast_episode_resume_state_is_still_nullable(real_models):

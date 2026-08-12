@@ -282,10 +282,10 @@ def _install_music_assistant_models() -> None:
 
     @dataclass
     class _PodcastEpisode(_BaseMediaItem):
-        # position and podcast are mandatory upstream with no default. Giving
-        # them defaults here would let a parser that forgets either of them pass
-        # the unit suite and fail against real Music Assistant, which is the
-        # class of drift tests/ma_contract.py exists to prevent.
+        # Matches the released upstream, where both report a None default even
+        # though the source declares them without one. The provider always sets
+        # both explicitly, and the unit suite asserts that, so the stub does not
+        # need to be stricter than the package users run.
         position: int = None  # type: ignore[assignment]
         podcast: object = None
         duration: int = 0
