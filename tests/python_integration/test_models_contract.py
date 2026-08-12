@@ -83,6 +83,50 @@ def test_audio_format_accepts_the_values_the_provider_assigns(real_models):
     assert audio_format.bit_rate == 160
 
 
+def test_media_type_has_the_members_the_provider_uses(real_models):
+    media_type = real_models.enums.MediaType
+    missing = [
+        name for name in ma_contract.REQUIRED_MEDIA_TYPE_MEMBERS if not hasattr(media_type, name)
+    ]
+    assert not missing, f"upstream MediaType lost members the provider uses: {missing}"
+
+
+def test_podcast_exposes_the_fields_the_provider_sets(real_models):
+    fields = {f.name for f in dataclasses.fields(real_models.media_items.Podcast)}
+    missing = set(ma_contract.REQUIRED_PODCAST_FIELDS) - fields
+    assert not missing, f"upstream Podcast lost fields the provider sets: {missing}"
+
+
+def test_podcast_episode_exposes_the_fields_the_provider_sets(real_models):
+    fields = {f.name for f in dataclasses.fields(real_models.media_items.PodcastEpisode)}
+    missing = set(ma_contract.REQUIRED_PODCAST_EPISODE_FIELDS) - fields
+    assert not missing, f"upstream PodcastEpisode lost fields the provider sets: {missing}"
+
+
+# Deliberately not asserted here: that ``position`` and ``podcast`` are
+# *mandatory* upstream. The source on the models repo's main branch declares
+# them without a default, but ``dataclasses.fields()`` on the released 1.1.186
+# reports ``position.default is None``, so an assertion written from the source
+# failed against the package users actually run. The provider sets both fields
+# explicitly on every episode it builds and the unit suite pins that, which is
+# the property worth protecting; how strict upstream chooses to be about it is
+# upstream's business.
+
+
+def test_podcast_episode_resume_state_is_still_nullable(real_models):
+    """None means "provider does not know", and MA then uses its own resume point.
+
+    The provider leaves these unset because YouTube's anonymous responses carry
+    no reliable position. That is only correct while None keeps this meaning.
+    """
+    episode_fields = {f.name: f for f in dataclasses.fields(real_models.media_items.PodcastEpisode)}
+    for name in ma_contract.NULLABLE_PODCAST_EPISODE_FIELDS:
+        assert episode_fields[name].default is None, (
+            f"PodcastEpisode.{name} no longer defaults to None; the provider "
+            "would now be asserting a resume position it does not have"
+        )
+
+
 def test_stream_details_exposes_the_fields_the_provider_sets(real_models):
     fields = {f.name for f in dataclasses.fields(real_models.streamdetails.StreamDetails)}
     missing = set(ma_contract.REQUIRED_STREAM_DETAILS_FIELDS) - fields

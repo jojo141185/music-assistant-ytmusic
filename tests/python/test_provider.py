@@ -2496,6 +2496,255 @@ def test_cached_playlist_tracks_still_reach_the_caller(provider):
     assert [t.name for t in tracks] == ["Good"]
 
 
+# ---------------------------------------------------------------------------
+# Podcasts (issue #52)
+#
+# Anonymous throughout: search, show detail and episode detail all answer
+# without an account, and an episode is an ordinary YouTube video id so the
+# existing stream path carries it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("3 hr 46 min", 3 * 3600 + 46 * 60),
+        ("2 hr 3 min", 2 * 3600 + 3 * 60),
+        ("31 min", 31 * 60),
+        ("1 hr", 3600),
+        ("45 sec", 45),
+        ("1 hour 2 minutes 3 seconds", 3723),
+        ("1h 2m", 3720),
+        # Tracks report a clock string; the same helper has to read both, since
+        # which spelling arrives depends on the endpoint rather than the item.
+        ("3:46", 226),
+        ("1:02:03", 3723),
+    ],
+)
+def test_parse_duration_words(raw, expected):
+    assert ytm._parse_duration_words(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", "unknown", "views"])
+def test_parse_duration_words_returns_none_when_unreadable(raw):
+    """None, not 0. An unset duration is not the same as a zero-length episode."""
+    assert ytm._parse_duration_words(raw) is None
+
+
+def test_episode_id_round_trips():
+    item_id = ytm._episode_item_id("PLabc123", "vid00000001")
+    assert item_id == "PLabc123|vid00000001"
+    assert ytm._split_episode_id(item_id) == ("PLabc123", "vid00000001")
+
+
+def test_split_episode_id_treats_a_bare_id_as_the_video():
+    assert ytm._split_episode_id("vid00000001") == ("", "vid00000001")
+
+
+def test_strip_podcast_browse_prefix():
+    assert ytm._strip_podcast_browse_prefix("MPSPPLabc123") == "PLabc123"
+    assert ytm._strip_podcast_browse_prefix("PLabc123") == "PLabc123"
+    assert ytm._strip_podcast_browse_prefix("") == ""
+
+
+def test_description_text_handles_both_shapes():
+    """get_podcast returns a str; get_episode returns a Description object."""
+
+    class _Description:
+        text = "from the object"
+
+        def __str__(self):  # pragma: no cover - would be the bug
+            return "Description()"
+
+    assert ytm._description_text("plain") == "plain"
+    assert ytm._description_text(_Description()) == "from the object"
+    assert ytm._description_text(None) is None
+    assert ytm._description_text("") is None
+
+
+def test_parse_podcast_strips_the_browse_prefix(provider):
+    podcast = provider._parse_podcast(
+        {"browseId": "MPSPPLabc123", "title": "A Show", "author": {"name": "A Publisher"}}
+    )
+    assert podcast.item_id == "PLabc123"
+    assert podcast.name == "A Show"
+    assert podcast.publisher == "A Publisher"
+
+
+def test_parse_podcast_accepts_a_string_author(provider):
+    podcast = provider._parse_podcast({"title": "S", "author": "Someone"}, "PLabc123")
+    assert podcast.publisher == "Someone"
+
+
+def test_parse_podcast_raises_without_an_id(provider):
+    with pytest.raises(InvalidDataError):
+        provider._parse_podcast({"title": "No id"})
+
+
+def _podcast(provider):
+    return provider._parse_podcast({"title": "A Show"}, "PLabc123")
+
+
+def test_parse_podcast_episode_builds_a_composite_id(provider):
+    episode = provider._parse_podcast_episode(
+        {"videoId": "vid00000001", "title": "Ep 1", "duration": "31 min"},
+        _podcast(provider),
+        position=7,
+    )
+    assert episode.item_id == "PLabc123|vid00000001"
+    assert episode.position == 7
+    assert episode.duration == 31 * 60
+    assert episode.podcast.item_id == "PLabc123"
+    assert all("watch?v=vid00000001" in m.url for m in episode.provider_mappings)
+
+
+def test_parse_podcast_episode_leaves_resume_state_unset(provider):
+    """None tells Music Assistant to use its own resume point.
+
+    YouTube's anonymous responses carry no playback position, so asserting one
+    would be inventing it.
+    """
+    episode = provider._parse_podcast_episode(
+        {"videoId": "vid00000001", "title": "Ep"}, _podcast(provider)
+    )
+    assert episode.fully_played is None
+    assert episode.resume_position_ms is None
+
+
+def test_parse_podcast_episode_ignores_the_date_field(provider):
+    """"date" holds a view count on anonymous responses, not a date.
+
+    Measured as "591K views" on every episode of every show checked. Parsing it
+    as a release date would either raise or land a nonsense date on the item.
+    """
+    episode = provider._parse_podcast_episode(
+        {"videoId": "vid00000001", "title": "Ep", "date": "591K views"},
+        _podcast(provider),
+    )
+    assert getattr(episode.metadata, "release_date", None) is None
+
+
+def test_parse_podcast_episode_raises_without_a_video_id(provider):
+    with pytest.raises(InvalidDataError):
+        provider._parse_podcast_episode({"title": "No id"}, _podcast(provider))
+
+
+def test_get_podcast_episodes_numbers_them_when_index_is_absent(provider):
+    """"index" is None on every anonymous response, so enumeration is all we have."""
+    mock = MagicMock()
+    mock.get_podcast.return_value = {
+        "title": "A Show",
+        "episodes": [
+            {"videoId": "v1", "title": "One", "duration": "31 min"},
+            {"videoId": "v2", "title": "Two", "duration": "1 hr"},
+        ],
+    }
+    provider._ytmusic = mock
+
+    async def _collect():
+        return [e async for e in provider.get_podcast_episodes("PLabc123")]
+
+    episodes = asyncio.run(_collect())
+    assert [e.position for e in episodes] == [1, 2]
+    assert [e.duration for e in episodes] == [31 * 60, 3600]
+
+
+def test_get_podcast_episodes_skips_an_unparseable_entry(provider):
+    """One malformed episode must not sink the whole show."""
+    mock = MagicMock()
+    mock.get_podcast.return_value = {
+        "title": "A Show",
+        "episodes": [{"title": "no video id"}, {"videoId": "v2", "title": "Two"}],
+    }
+    provider._ytmusic = mock
+
+    async def _collect():
+        return [e async for e in provider.get_podcast_episodes("PLabc123")]
+
+    assert [e.name for e in asyncio.run(_collect())] == ["Two"]
+
+
+def test_get_podcast_raises_media_not_found(provider):
+    mock = MagicMock()
+    mock.get_podcast.side_effect = KeyError("nope")
+    provider._ytmusic = mock
+    with pytest.raises(MediaNotFoundError):
+        asyncio.run(provider.get_podcast("PLmissing"))
+
+
+def test_get_podcast_episode_falls_back_to_a_stub_show(provider):
+    """A failed show lookup must not make the episode unplayable."""
+    mock = MagicMock()
+    mock.get_episode.return_value = {
+        "title": "Ep",
+        "duration": "31 min",
+        "author": {"name": "The Show", "id": "MPSPPLabc123"},
+    }
+    mock.get_podcast.side_effect = RuntimeError("show lookup failed")
+    provider._ytmusic = mock
+
+    episode = asyncio.run(provider.get_podcast_episode("PLabc123|vid00000001"))
+
+    assert episode.item_id == "PLabc123|vid00000001"
+    assert episode.podcast.name == "The Show"
+
+
+def test_get_stream_details_resolves_a_podcast_episode_id(provider):
+    """The show has to be stripped before yt-dlp sees the id."""
+    seen = {}
+
+    async def _fmt(video_id):
+        seen["video_id"] = video_id
+        return {"url": "https://stream.example/x", "ext": "m4a"}
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(
+        provider.get_stream_details("PLabc123|vid00000001", MediaType.PODCAST_EPISODE)
+    )
+
+    assert seen["video_id"] == "vid00000001"
+    assert sd.item_id == "PLabc123|vid00000001"
+
+
+def test_search_returns_podcasts(provider):
+    mock = MagicMock()
+    mock.search.return_value = [
+        {
+            "resultType": "podcast",
+            "browseId": "MPSPPLabc123",
+            "title": "A Show",
+            "category": "Podcasts",
+        }
+    ]
+    provider._ytmusic = mock
+
+    results = asyncio.run(provider.search("a show", [MediaType.PODCAST]))
+
+    assert [p.item_id for p in results.podcasts] == ["PLabc123"]
+
+
+def test_podcast_lookups_are_cached():
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    for name in ("get_podcast", "get_podcast_episode"):
+        args = getattr(getattr(YoutubeMusicFreeProvider, name), "__ma_cache__", None)
+        assert args is not None, f"{name} is not cached"
+        assert args["expiration"] == ytm.PODCAST_CACHE_TTL
+
+
+def test_library_podcasts_is_not_advertised():
+    """Pass one is anonymous, and declaring a library we cannot read is unsafe.
+
+    Music Assistant deletes anything a completed sync did not return, so a
+    LIBRARY_PODCASTS feature with no working implementation behind it is the
+    issue #55 failure mode with a new media type.
+    """
+    feature = getattr(ytm.ProviderFeature, "LIBRARY_PODCASTS", None)
+    if feature is None:
+        pytest.skip("stub ProviderFeature has no LIBRARY_PODCASTS member")
+    assert feature not in (ytm.BASE_FEATURES | ytm.AUTHENTICATED_FEATURES)
+
+
 def test_get_album_raises_when_not_found(provider):
     mock = MagicMock()
     mock.get_album = MagicMock(return_value=None)

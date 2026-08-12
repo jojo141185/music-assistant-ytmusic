@@ -20,11 +20,11 @@ from pathlib import Path
 import pytest
 
 # Imports below are resolved against the stubs registered in conftest.py.
-from music_assistant_models.enums import ContentType
+from music_assistant_models.enums import ContentType, MediaType
 
 # Imported from media_items, not streamdetails, because that is the path the
 # provider itself uses. Upstream re-exports the same class from both.
-from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.media_items import AudioFormat, Podcast, PodcastEpisode
 from music_assistant_models.streamdetails import StreamDetails
 
 TESTS_ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +83,25 @@ def test_stub_audio_format_has_the_required_fields():
 
 def test_stub_bit_rate_defaults_to_none():
     assert AudioFormat().bit_rate is None
+
+
+def test_stub_media_type_has_the_required_members():
+    missing = [
+        name for name in ma_contract.REQUIRED_MEDIA_TYPE_MEMBERS if not hasattr(MediaType, name)
+    ]
+    assert not missing, f"stub MediaType is missing {missing}; see tests/ma_contract.py"
+
+
+def test_stub_podcast_has_the_required_fields():
+    fields = {f.name for f in dataclasses.fields(Podcast)}
+    missing = set(ma_contract.REQUIRED_PODCAST_FIELDS) - fields
+    assert not missing, f"stub Podcast is missing {missing}"
+
+
+def test_stub_podcast_episode_has_the_required_fields():
+    fields = {f.name for f in dataclasses.fields(PodcastEpisode)}
+    missing = set(ma_contract.REQUIRED_PODCAST_EPISODE_FIELDS) - fields
+    assert not missing, f"stub PodcastEpisode is missing {missing}"
 
 
 def test_stub_stream_details_has_the_required_fields():
