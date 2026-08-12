@@ -76,17 +76,22 @@ jobs:
         run: |
           {
             if [ "${{ steps.live.outcome }}" = "success" ]; then
-              echo "## Anonymous extraction is working"
+              echo "## Anonymous extraction and playback are working"
               echo
-              echo "yt-dlp resolved an audio-only stream above the bitrate floor."
+              echo "yt-dlp resolved an audio-only stream above the bitrate floor,"
+              echo "and the resolved url served real bytes when fetched immediately."
             else
-              echo "## Anonymous extraction FAILED"
+              echo "## Anonymous extraction or playback FAILED"
               echo
               echo "This usually means one of:"
               echo
               echo "- yt-dlp's default clients now require a PO token for anonymous playback"
               echo "- the YouTube extractor is broken in the installed yt-dlp release"
               echo "- this runner's IP is rate-limited or bot-blocked by YouTube"
+              echo "- a url resolved but 403'd on fetch. That is the issue #51 shape:"
+              echo "  a pre-roll ad window the provider failed to wait out. Check the"
+              echo "  failing test name — if it is the fetch or the available_at check,"
+              echo "  the problem is playback rather than extraction."
               echo
               echo "This already retried once, so a one-off block has been ruled out."
               echo "A blocked runner IP remains the most likely cause and says nothing"
@@ -104,10 +109,10 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail the run if extraction is broken
+      - name: Fail the run if extraction or playback is broken
         # The whole point of the canary. Without this the job concludes green,
         # GitHub sends nothing, and the summary above is read by nobody.
         if: steps.live.outcome == 'failure'
         run: |
-          echo "::error title=Anonymous extraction failed::yt-dlp could not resolve an audio stream for any known video, after a retry. See the job summary for what to check."
+          echo "::error title=Anonymous extraction or playback failed::yt-dlp could not resolve a usable audio stream for any known video, or the resolved url did not serve bytes, after a retry. See the job summary for what to check."
           exit 1

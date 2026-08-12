@@ -3,7 +3,12 @@ pytest>=8.0
 # selector against synthetic format tables. No network access is involved.
 # Kept in step with the floor in ytmusic_free/manifest.json so CI exercises a
 # version the provider actually claims to support.
-yt-dlp>=2025.1.12
+yt-dlp>=2025.12.8
 # Only the live suite needs this, to reach the radio/watch endpoint that serves
 # auto-generated mixes. The offline tests stub the client out entirely.
 ytmusicapi>=1.7.0
+# The AI-blocklist refresh fetches through Music Assistant's aiohttp session and
+# builds an aiohttp.ClientTimeout. MA always ships aiohttp; the provider imports
+# it lazily so the rest of the suite runs without it, but the tests that cover
+# that refresh path need it present.
+aiohttp>=3.9

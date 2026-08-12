@@ -35,6 +35,10 @@ def test_module_constants_present():
     assert ytm.YTM_DOMAIN == "https://music.youtube.com"
     assert ytm.VARIOUS_ARTISTS_YTM_ID == "UCUTXlgdcKU5vfzFqHOWIvkA"
     assert ytm.DEFAULT_STREAM_URL_EXPIRATION == 3600
+    # A cap, not a target. Has to clear a realistic multi-ad pod (the mid
+    # thirties) without letting a bogus timestamp present as a hung player.
+    assert 40 <= ytm.MAX_PREROLL_WAIT <= 90
+    assert ytm.MIN_YTDLP_VERSION_FOR_PREROLL == (2025, 12, 8)
 
 
 def test_base_features_are_anonymous_safe():
@@ -995,6 +999,9 @@ def test_get_config_entries_returns_expected_keys():
         ytm.CONF_BRAND_ACCOUNT,
         ytm.CONF_AUTH_USER,
         ytm.CONF_PREFER_AUDIO_QUALITY,
+        ytm.CONF_FILTER_AI_MUSIC,
+        ytm.CONF_AI_BLOCKLIST,
+        ytm.CONF_AI_BLOCKLIST_URL,
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
@@ -1539,6 +1546,572 @@ def test_get_stream_details_no_trim_has_no_args(provider):
     provider._get_stream_format = _fmt
     sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
     assert sd.extra_input_args == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-roll ad window (issue #51)
+#
+# YouTube serves some tracks behind a pre-roll ad, and the media URL it hands
+# back is not valid until that window has passed: fetching early returns 403.
+# yt-dlp reports the window as ``available_at`` and its own downloader sleeps
+# until then. The provider hands the URL to Music Assistant instead, so it has
+# to do the waiting itself or the fetch fails and the track is skipped.
+# ---------------------------------------------------------------------------
+
+
+def test_preroll_wait_is_zero_when_the_field_is_absent():
+    """An older yt-dlp predating the field has to keep working."""
+    assert ytm._preroll_wait_seconds({"url": "https://stream.example/x"}) == 0.0
+
+
+@pytest.mark.parametrize("value", [None, 0, "", False])
+def test_preroll_wait_is_zero_for_empty_values(value):
+    assert ytm._preroll_wait_seconds({"available_at": value}) == 0.0
+
+
+def test_preroll_wait_is_zero_when_the_window_has_passed():
+    assert ytm._preroll_wait_seconds({"available_at": 990.0}, now=1000.0) == 0.0
+
+
+def test_preroll_wait_is_zero_at_the_exact_boundary():
+    assert ytm._preroll_wait_seconds({"available_at": 1000.0}, now=1000.0) == 0.0
+
+
+def test_preroll_wait_returns_the_remaining_window():
+    assert ytm._preroll_wait_seconds({"available_at": 1005.0}, now=1000.0) == 5.0
+
+
+def test_preroll_wait_is_capped():
+    """A malformed timestamp must not stall the queue indefinitely."""
+    wait = ytm._preroll_wait_seconds({"available_at": 2**40}, now=1000.0)
+    assert wait == ytm.MAX_PREROLL_WAIT
+
+
+def test_preroll_wait_survives_an_unparseable_value():
+    """Never raise out of the stream path over a field we only advise on."""
+    assert ytm._preroll_wait_seconds({"available_at": "soon"}, now=1000.0) == 0.0
+
+
+def test_preroll_wait_takes_the_latest_of_a_merged_format():
+    """Mirrors yt-dlp's own max() over ``requested_formats``.
+
+    A merged format carries the timestamps on its parts, and the URL is only
+    good once the latest-gated part is available.
+    """
+    fmt = {
+        "requested_formats": [
+            {"available_at": 1003.0},
+            {"available_at": 1007.0},
+        ]
+    }
+    assert ytm._preroll_wait_seconds(fmt, now=1000.0) == 7.0
+
+
+def test_preroll_wait_ignores_junk_entries_in_requested_formats():
+    fmt = {"requested_formats": [None, "nonsense", {"available_at": 1004.0}]}
+    assert ytm._preroll_wait_seconds(fmt, now=1000.0) == 4.0
+
+
+def test_get_stream_details_waits_out_the_preroll_window(provider, monkeypatch):
+    """The actual issue #51 guard: without this the URL 403s on arrival."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + 5,
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept, (
+        "the provider handed over the url without waiting for the pre-roll "
+        "window, which is exactly the 403 in issue #51"
+    )
+    assert 4.0 < slept[0] <= 5.0
+    assert sd.path == "https://stream.example/x"
+
+
+def test_get_stream_details_does_not_wait_without_a_preroll(provider, monkeypatch):
+    """The common path stays instant; a wait on every track would be a regression."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        # yt-dlp reports available_at ~= now for a track with no ad in front.
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time(),
+        }
+
+    provider._get_stream_format = _fmt
+    asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept == []
+
+
+@pytest.mark.parametrize(
+    ("version", "honours"),
+    [
+        # Field absent entirely on these, so the answer is moot: _preroll_wait_
+        # seconds returns 0.0 either way. False falls out of a plain version
+        # comparison and needs no special case.
+        ("2025.01.12", False),
+        ("2025.08.11", False),
+        # The bad range: available_at exists but is a flat +6s on every format,
+        # ad or not. Honouring it here would delay every single track.
+        ("2025.08.20", False),
+        ("2025.10.01", False),
+        ("2025.11.12", False),
+        # Ad-derived from here on, which is the behaviour the fix assumes.
+        ("2025.12.08", True),
+        ("2026.07.04", True),
+        # Unreadable versions fail towards honouring, because a modern yt-dlp
+        # only asks for a wait when there is really an ad.
+        ("", True),
+        (None, True),
+        ("2026.07", True),
+        ("nightly", True),
+        ("2026.07.04.123456", True),
+    ],
+)
+def test_ytdlp_preroll_support_by_version(version, honours):
+    assert ytm._ytdlp_honours_preroll(version) is honours
+
+
+def test_installed_ytdlp_is_new_enough_for_the_preroll_fix():
+    """The version this repo tests against must be one where the fix applies.
+
+    If CI ever pins a yt-dlp inside the flat-+6s range, the wait switches off
+    and the live canary stops covering issue #51 without anything going red.
+    """
+    yt_dlp = pytest.importorskip("yt_dlp")
+    version = yt_dlp.version.__version__
+    assert ytm._ytdlp_honours_preroll(version), (
+        f"installed yt-dlp {version} predates ad-derived available_at; the "
+        "pre-roll wait is disabled and the live canary cannot see issue #51"
+    )
+
+
+def test_preroll_wait_is_skipped_on_a_yt_dlp_that_gets_it_wrong(provider, monkeypatch):
+    """The +6s-on-everything releases must not delay every track."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + 6,
+        }
+
+    provider._get_stream_format = _fmt
+    provider._preroll_supported = False
+    asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept == []
+
+
+def test_get_stream_details_waits_before_reading_the_url(provider, monkeypatch):
+    """Ordering matters: the wait has to be over before the URL is handed on.
+
+    Asserting it structurally, by recording what has happened at the moment the
+    sleep is entered. A wait that runs after the StreamDetails is built would
+    still pass a naive "did it sleep" check while fixing nothing.
+    """
+    seen = {}
+
+    async def _fake_sleep(seconds):
+        seen["slept_before_return"] = True
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        seen["resolved"] = True
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + 3,
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert seen == {"resolved": True, "slept_before_return": True}
+    assert sd.path == "https://stream.example/x"
+
+
+# ---------------------------------------------------------------------------
+# AI-music filter (issue #53)
+#
+# Applies to auto-generated lists only: radio, mixes, similar tracks and the
+# home feed. Search, library and hand-picked playlists are deliberately left
+# alone, so a deliberate lookup still finds what the user asked for.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    async def text(self):
+        return self._body
+
+
+class _FakeGet:
+    """Stands in for ``session.get(...)`` used as an async context manager."""
+
+    def __init__(self, body=None, error=None):
+        self._body = body
+        self._error = error
+
+    async def __aenter__(self):
+        if self._error is not None:
+            raise self._error
+        return _FakeResponse(self._body)
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _http_session_returning(body):
+    mass = MagicMock()
+    mass.http_session.get = lambda url, timeout=None: _FakeGet(body=body)
+    return mass
+
+
+def _http_session_raising(error):
+    mass = MagicMock()
+    mass.http_session.get = lambda url, timeout=None: _FakeGet(error=error)
+    return mass
+
+
+def _blocklist_track(artist_name="Some Artist", artist_id="UC000000000000000000000a"):
+    """A Track carrying one artist, shaped the way _parse_track builds them."""
+    track = ytm.Track(
+        item_id="vid00000001",
+        provider="ytmusic_free",
+        name="A Song",
+    )
+    track.artists = [
+        ytm.ItemMapping(
+            media_type=MediaType.ARTIST,
+            item_id=artist_id,
+            provider="ytmusic_free",
+            name=artist_name,
+        )
+    ]
+    return track
+
+
+def test_parse_blocklist_reads_plain_text():
+    ids, names = ytm._parse_blocklist(
+        "# a comment\nSloppy Bot\nUC000000000000000000000a\n\n  Spaced   Name  # trailing\n"
+    )
+    assert ids == frozenset({"UC000000000000000000000a"})
+    assert names == frozenset({"sloppy bot", "spaced name"})
+
+
+def test_parse_blocklist_reads_a_json_array():
+    ids, names = ytm._parse_blocklist('["Sloppy Bot", "UC000000000000000000000a"]')
+    assert ids == frozenset({"UC000000000000000000000a"})
+    assert names == frozenset({"sloppy bot"})
+
+
+def test_parse_blocklist_reads_a_json_object_with_an_artists_key():
+    ids, names = ytm._parse_blocklist('{"artists": ["Sloppy Bot"], "note": "ignored"}')
+    assert names == frozenset({"sloppy bot"})
+    assert ids == frozenset()
+
+
+def test_parse_blocklist_reads_json_objects_per_entry():
+    raw = '[{"name": "Sloppy Bot"}, {"channel_id": "UC000000000000000000000a"}]'
+    ids, names = ytm._parse_blocklist(raw)
+    assert ids == frozenset({"UC000000000000000000000a"})
+    assert names == frozenset({"sloppy bot"})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "\n\n",
+        "# only comments\n",
+        "[1, 2, 3]",
+        '{"unexpected": {"shape": true}}',
+        '{\n  "totally": "different"\n}',
+        "[]",
+        "{}",
+    ],
+)
+def test_parse_blocklist_yields_nothing_for_unusable_input(raw):
+    """A list that changes shape must filter nothing, not break playback.
+
+    The JSON cases matter most: valid JSON we do not understand must produce
+    an empty list rather than falling through to the line parser, which would
+    otherwise register every line of the document as an artist name.
+    """
+    assert ytm._parse_blocklist(raw) == (frozenset(), frozenset())
+
+
+def test_parse_blocklist_treats_unparseable_text_as_plain_lines():
+    """Not-quite-JSON is still a plain-text list as far as we are concerned."""
+    ids, names = ytm._parse_blocklist("not json {\nReal Bot")
+    assert "real bot" in names
+    assert ids == frozenset()
+
+
+def test_parse_blocklist_never_yields_an_empty_name():
+    """An empty entry would match every track with a nameless artist."""
+    _, names = ytm._parse_blocklist("Real Name\n   \n#\n")
+    assert "" not in names
+
+
+def test_ai_filter_is_a_no_op_when_disabled(provider):
+    provider._ai_filter_enabled = False
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    tracks = [_blocklist_track("Sloppy Bot")]
+    assert provider._drop_ai_tracks(tracks, "test") == tracks
+
+
+def test_ai_filter_is_a_no_op_with_an_empty_blocklist(provider):
+    """Enabling the toggle without a list must not silently filter anything."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset()
+    provider._ai_blocked_channel_ids = frozenset()
+    tracks = [_blocklist_track("Sloppy Bot")]
+    assert provider._drop_ai_tracks(tracks, "test") == tracks
+
+
+def test_ai_filter_drops_a_blocked_name(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    kept = provider._drop_ai_tracks(
+        [_blocklist_track("Sloppy Bot"), _blocklist_track("Real Band")], "test"
+    )
+    assert [t.artists[0].name for t in kept] == ["Real Band"]
+
+
+def test_ai_filter_matches_names_case_and_space_insensitively(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    assert provider._drop_ai_tracks([_blocklist_track("  SLOPPY   Bot ")], "test") == []
+
+
+def test_ai_filter_drops_a_blocked_channel_id(provider):
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_channel_ids = frozenset({"UC000000000000000000000a"})
+    kept = provider._drop_ai_tracks(
+        [
+            _blocklist_track("Innocent", artist_id="UC000000000000000000000a"),
+            _blocklist_track("Innocent", artist_id="UC000000000000000000000b"),
+        ],
+        "test",
+    )
+    assert [t.artists[0].item_id for t in kept] == ["UC000000000000000000000b"]
+
+
+def test_ai_filter_keeps_a_track_with_no_artists(provider):
+    """Never drop something just because we could not read who made it."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    track = _blocklist_track()
+    track.artists = []
+    assert provider._drop_ai_tracks([track], "test") == [track]
+
+
+def test_load_ai_filter_config_splits_commas_and_newlines(provider):
+    provider.config = MagicMock()
+    provider.config.get_value = lambda key: {
+        ytm.CONF_FILTER_AI_MUSIC: True,
+        ytm.CONF_AI_BLOCKLIST: "Sloppy Bot, Other Bot\nUC000000000000000000000a",
+        ytm.CONF_AI_BLOCKLIST_URL: "  ",
+    }.get(key)
+
+    provider._load_ai_filter_config()
+
+    assert provider._ai_filter_enabled is True
+    assert provider._ai_blocked_names == frozenset({"sloppy bot", "other bot"})
+    assert provider._ai_blocked_channel_ids == frozenset({"UC000000000000000000000a"})
+    assert provider._ai_blocklist_url == ""
+
+
+def test_remote_blocklist_merges_over_local_entries(provider):
+    """A refresh must add to the user's own list, never replace it."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset({"my own entry"})
+    provider._ai_local_channel_ids = frozenset()
+    provider.mass = _http_session_returning('["Remote Bot"]')
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocked_names == frozenset({"my own entry", "remote bot"})
+    assert provider._ai_blocklist_fetched_at > 0
+
+
+def test_remote_blocklist_failure_keeps_the_previous_list(provider):
+    """An unreachable list must not silently switch the filter off."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset({"my own entry"})
+    provider._ai_blocked_names = frozenset({"my own entry", "previously fetched"})
+    provider.mass = _http_session_raising(OSError("connection refused"))
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocked_names == frozenset({"my own entry", "previously fetched"})
+    assert provider._ai_blocklist_refreshing is False
+
+
+def test_remote_blocklist_refresh_clears_its_in_flight_flag_on_success(provider):
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset()
+    provider._ai_local_channel_ids = frozenset()
+    provider.mass = _http_session_returning("Remote Bot")
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocklist_refreshing is False
+
+
+def test_similar_tracks_are_filtered(provider):
+    """The path Music Assistant's own radio mode pulls from."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_similar_tracks("vid00000001"))
+
+    assert [t.name for t in tracks] == ["Good"]
+
+
+def test_similar_tracks_are_untouched_when_the_filter_is_off(provider):
+    provider._ai_filter_enabled = False
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_similar_tracks("vid00000001"))
+
+    assert [t.name for t in tracks] == ["Good", "Slop"]
+
+
+def test_recommendations_are_filtered(provider):
+    """The home feed is auto-generated too, so it is in scope for the filter."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.get_home.return_value = [
+        {
+            "title": "Listen again",
+            "contents": [
+                {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+                {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            ],
+        }
+    ]
+    provider._ytmusic = mock
+
+    folders = asyncio.run(provider.recommendations())
+
+    assert [i.name for f in folders for i in f.items] == ["Good"]
+
+
+def test_recommendations_drop_a_folder_left_empty_by_the_filter(provider):
+    """An all-slop shelf should disappear rather than render empty."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.get_home.return_value = [
+        {
+            "title": "All slop",
+            "contents": [
+                {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+            ],
+        }
+    ]
+    provider._ytmusic = mock
+
+    assert asyncio.run(provider.recommendations()) == []
+
+
+def test_radio_playlist_tracks_are_filtered(provider):
+    """Mixes and song radio are the main way slop reaches a queue."""
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {"videoId": "vid00000001", "title": "Good", "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}]},
+            {"videoId": "vid00000002", "title": "Slop", "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}]},
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider._get_radio_playlist_tracks("RDdQw4w9WgXcQ"))
+
+    assert [t.name for t in tracks] == ["Good"]
+
+
+def test_search_results_are_never_filtered(provider):
+    """A deliberate lookup must still find what the user asked for.
+
+    This is the scope boundary of the feature: filtering search would make a
+    blocked artist unfindable, which is a different and more surprising
+    behaviour than keeping them out of auto-generated queues.
+    """
+    provider._ai_filter_enabled = True
+    provider._ai_blocked_names = frozenset({"sloppy bot"})
+    mock = MagicMock()
+    mock.search.return_value = [
+        {
+            "videoId": "vid00000002",
+            "title": "Slop",
+            "resultType": "song",
+            "artists": [{"name": "Sloppy Bot", "id": "UC000000000000000000000a"}],
+        }
+    ]
+    provider._ytmusic = mock
+
+    results = asyncio.run(provider.search("sloppy bot", [MediaType.TRACK]))
+
+    assert [t.name for t in results.tracks] == ["Slop"]
 
 
 def test_get_album_raises_when_not_found(provider):

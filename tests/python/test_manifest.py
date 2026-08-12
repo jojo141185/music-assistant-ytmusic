@@ -46,6 +46,27 @@ def test_manifest_requirements_pin_known_libs(manifest):
     assert "duration-parser" not in joined
 
 
+def test_manifest_yt_dlp_floor_covers_the_preroll_field(manifest):
+    """A fresh install must land on a yt-dlp the pre-roll fix can trust.
+
+    ``available_at`` exists from 2025.08.20 but is a flat +6s on every format
+    until 2025.12.08, so the floor has to clear the later date. The provider
+    also guards at runtime (``_ytdlp_honours_preroll``), because pip will not
+    upgrade an already-satisfied requirement and existing installs keep
+    whatever they first resolved. See issue #51.
+    """
+    import ytmusic_free as ytm
+
+    requirement = next(r for r in manifest["requirements"] if r.startswith("yt-dlp"))
+    _, _, floor = requirement.partition(">=")
+    assert floor, f"expected a >= floor on yt-dlp, got {requirement!r}"
+    parsed = tuple(int(part) for part in floor.split("."))
+    assert parsed >= ytm.MIN_YTDLP_VERSION_FOR_PREROLL, (
+        f"manifest allows yt-dlp {floor}, which predates ad-derived "
+        "available_at; a fresh install would wait 6s before every track"
+    )
+
+
 def test_manifest_documentation_url_present(manifest):
     assert manifest.get("documentation", "").startswith("https://")
 

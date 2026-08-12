@@ -83,6 +83,32 @@ def test_audio_format_accepts_the_values_the_provider_assigns(real_models):
     assert audio_format.bit_rate == 160
 
 
+def test_stream_details_exposes_the_fields_the_provider_sets(real_models):
+    fields = {f.name for f in dataclasses.fields(real_models.streamdetails.StreamDetails)}
+    missing = set(ma_contract.REQUIRED_STREAM_DETAILS_FIELDS) - fields
+    assert not missing, f"upstream StreamDetails lost fields the provider sets: {missing}"
+
+
+def test_stream_details_still_cannot_express_delayed_availability(real_models):
+    """Why ``get_stream_details`` blocks instead of handing over a timestamp.
+
+    YouTube serves some tracks behind a pre-roll ad and the media url 403s
+    until that window passes (issue #51). yt-dlp reports it as ``available_at``
+    and sleeps; the provider has to sleep too, because there is no field on
+    StreamDetails that would let Music Assistant schedule the wait instead.
+
+    If upstream adds one, this test fails and the sleep in
+    ``get_stream_details`` should move behind that field, so the provider call
+    stops blocking.
+    """
+    fields = {f.name for f in dataclasses.fields(real_models.streamdetails.StreamDetails)}
+    present = sorted(fields.intersection(ma_contract.FORBIDDEN_STREAM_DETAILS_FIELDS))
+    assert not present, (
+        f"upstream StreamDetails gained {present}; the pre-roll sleep in "
+        "get_stream_details can now be handed to the server instead"
+    )
+
+
 def test_bit_rate_defaults_to_none_so_an_unset_value_is_distinguishable(real_models):
     """The provider only sets bit_rate when yt-dlp reported one.
 

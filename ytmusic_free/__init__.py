@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
 import os
 import re
@@ -70,6 +71,25 @@ if TYPE_CHECKING:
 YTM_DOMAIN = "https://music.youtube.com"
 VARIOUS_ARTISTS_YTM_ID = "UCUTXlgdcKU5vfzFqHOWIvkA"
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
+
+# Longest pre-roll window we will hold a track start for. A single skippable
+# ad is around 5 seconds (issue #51 measured 4 to 5) but yt-dlp sums a whole
+# pod, and two non-skippable ads back to back reach the mid-thirties, so the
+# cap has to clear that or it would truncate legitimate waits. Past it we hand
+# the URL over regardless and accept a possible 403: one skipped track is a
+# better failure than a player that sits silent for minutes with no signal.
+MAX_PREROLL_WAIT = 45.0
+
+# ``available_at`` first appeared in yt-dlp 2025.08.20, but it only became
+# ad-derived in 2025.12.08. On the releases in between it is a flat six seconds
+# in the future on *every* non-live format, ad or not, so honouring it there
+# would put six seconds of silence in front of every single track. Older
+# releases omit the field entirely and need no guard. The manifest still allows
+# yt-dlp>=2025.1.12, and pip will not upgrade an already-satisfied requirement,
+# so that bad range is reachable on real installs and has to be excluded here
+# rather than only in the manifest floor.
+MIN_YTDLP_VERSION_FOR_PREROLL = (2025, 12, 8)
+
 # Song radio and the personal mixes are effectively endless, so a full fetch has
 # no natural stopping point. Ask for a queue's worth and stop there.
 #
@@ -121,6 +141,23 @@ CONF_COOKIE = "cookie_header"
 CONF_BRAND_ACCOUNT = "brand_account"
 CONF_AUTH_USER = "auth_user"
 CONF_PREFER_AUDIO_QUALITY = "prefer_audio_quality"
+CONF_FILTER_AI_MUSIC = "filter_ai_music"
+CONF_AI_BLOCKLIST = "ai_blocklist"
+CONF_AI_BLOCKLIST_URL = "ai_blocklist_url"
+
+# How long a fetched remote blocklist is trusted before a refresh is scheduled.
+# These lists change on the order of days, and the refresh happens in the
+# background off a stale read, so nothing waits on it. See issue #53.
+AI_BLOCKLIST_TTL = 12 * 3600
+
+# Seconds to wait on the remote list before giving up. Short on purpose: a
+# slow or dead host must not delay the radio call that noticed the staleness.
+AI_BLOCKLIST_TIMEOUT = 15
+
+# A YouTube channel id. Used to tell "block this exact channel" apart from
+# "block anything by this artist name", because names collide and ids do not.
+CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
 AUTH_TYPE_NONE = "none"
 AUTH_TYPE_COOKIE = "cookie"
 
@@ -375,6 +412,136 @@ def _rank_audio_format(fmt: dict[str, Any], prefer_quality: bool) -> tuple[float
     return (1.0 if is_aac else 0.0, bitrate)
 
 
+def _normalize_artist_name(value: str) -> str:
+    """Fold an artist name to a form two spellings of it can both match."""
+    return " ".join(str(value).split()).casefold()
+
+
+def _parse_blocklist(raw: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Parse a blocklist document into (channel ids, normalized names).
+
+    Deliberately lenient about the format, because the whole point of the URL
+    field is to point at a list somebody else maintains, and we do not get to
+    dictate what they serve. Three shapes are understood:
+
+    * a JSON array of strings
+    * a JSON object with an ``artists``, ``channels`` or ``items`` array
+    * plain text, one entry per line, ``#`` starting a comment
+
+    Anything that parses as neither yields an empty pair rather than raising,
+    so a list that changes shape under us degrades to "filter nothing" instead
+    of breaking playback. Entries are classified by ``CHANNEL_ID_RE``: channel
+    ids match exactly, everything else matches on a folded name.
+    """
+    entries: list[str] = []
+    text = (raw or "").strip()
+    if not text:
+        return frozenset(), frozenset()
+
+    # Tracked separately from `entries`: valid JSON in a shape we do not
+    # recognise must yield nothing, not fall through to the line parser, which
+    # would otherwise turn every line of the document into an "artist name".
+    parsed_as_json = False
+    if text[0] in "[{":
+        with suppress(ValueError, TypeError, AttributeError):
+            loaded = json.loads(text)
+            parsed_as_json = True
+            if isinstance(loaded, dict):
+                for key in ("artists", "channels", "items"):
+                    if isinstance(loaded.get(key), list):
+                        loaded = loaded[key]
+                        break
+                else:
+                    loaded = []
+            if isinstance(loaded, list):
+                for item in loaded:
+                    if isinstance(item, str):
+                        entries.append(item)
+                    elif isinstance(item, dict):
+                        # Objects are common in community lists; take whichever
+                        # identifying field is present.
+                        for key in ("channel_id", "channelId", "id", "name", "artist"):
+                            if isinstance(item.get(key), str):
+                                entries.append(item[key])
+                                break
+
+    if not parsed_as_json:
+        for line in text.splitlines():
+            entry = line.split("#", 1)[0].strip()
+            if entry:
+                entries.append(entry)
+
+    channel_ids = {e.strip() for e in entries if CHANNEL_ID_RE.match(e.strip())}
+    names = {
+        _normalize_artist_name(e)
+        for e in entries
+        if e.strip() and not CHANNEL_ID_RE.match(e.strip())
+    }
+    return frozenset(channel_ids), frozenset(names - {""})
+
+
+def _ytdlp_honours_preroll(version: str | None) -> bool:
+    """Whether this yt-dlp's ``available_at`` actually tracks pre-roll ads.
+
+    See ``MIN_YTDLP_VERSION_FOR_PREROLL``. An unreadable or unexpected version
+    string returns True, because the field is only acted on when it is present
+    *and* in the future: guessing "honour" costs a wait that a modern yt-dlp
+    only asks for when there really is an ad, while guessing "ignore" would
+    silently reinstate issue #51 for anyone whose version we failed to parse.
+    """
+    if not version:
+        return True
+    parts = version.split(".")[:3]
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except (TypeError, ValueError):
+        return True
+    if len(parsed) < 3:
+        return True
+    return parsed >= MIN_YTDLP_VERSION_FOR_PREROLL
+
+
+def _preroll_wait_seconds(fmt: dict[str, Any], now: float | None = None) -> float:
+    """Seconds to wait before ``fmt``'s URL can actually be fetched.
+
+    When YouTube puts a pre-roll ad in front of a track it serves a media URL
+    that is not valid yet, and answers a fetch before the ad window with a 403.
+    yt-dlp models this as ``available_at``, a unix timestamp, and its own
+    downloader blocks on it ("Sleeping N seconds as required by the site")
+    before touching the URL.
+
+    We do not download; we hand the URL to Music Assistant, which fetches it at
+    once. So the wait has to happen here or the fetch 403s and the track is
+    skipped as unplayable. That was issue #51: extraction reported success,
+    playback failed, and nothing in between logged a reason.
+
+    Mirrors yt-dlp's own ``max(f.get('available_at') or 0 for f in
+    requested_formats)``: a merged format drops the field from the top level and
+    keeps it only on its parts, so taking the max means the wait covers whichever
+    part is gated latest. Absent, zero and unparseable all mean "no wait", so an
+    older yt-dlp that predates the field degrades to today's behaviour rather
+    than raising.
+
+    yt-dlp also offers ``use_ad_playback_context``, which suppresses the wait at
+    the source. It is not usable here: it only takes effect on the ``mweb`` and
+    ``web_music`` player clients, and pinning a client is exactly what PR #44
+    removed, for reasons that still hold.
+    """
+    now = time.time() if now is None else now
+    parts = fmt.get("requested_formats") or [fmt]
+    available_at = 0.0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        with suppress(TypeError, ValueError):
+            available_at = max(available_at, float(part.get("available_at") or 0))
+
+    wait = available_at - now
+    if wait <= 0:
+        return 0.0
+    return min(wait, MAX_PREROLL_WAIT)
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -454,6 +621,43 @@ async def get_config_entries(
             "128 kbps, though some accounts and regions are offered nothing better than a "
             "48 kbps AAC stream. Leave enabled unless you have a specific reason not to.",
         ),
+        ConfigEntry(
+            key=CONF_FILTER_AI_MUSIC,
+            type=ConfigEntryType.BOOLEAN,
+            label="Filter AI-generated music",
+            default_value=False,
+            required=False,
+            description="When enabled, tracks by artists on your blocklist are removed "
+            "from radio, mixes, similar tracks and recommendations before they reach the "
+            "queue. Search results, your library and playlists you chose yourself are "
+            "never filtered, so looking something up still finds it. Off by default, and "
+            "it does nothing until you give it a list below.",
+        ),
+        ConfigEntry(
+            key=CONF_AI_BLOCKLIST,
+            type=ConfigEntryType.STRING,
+            label="Blocked artists",
+            default_value="",
+            required=False,
+            depends_on=CONF_FILTER_AI_MUSIC,
+            description="One entry per line, or separated by commas. An entry is either "
+            "an artist name or a YouTube channel id (UC...). Names match loosely, ignoring "
+            "case and extra spaces; channel ids match exactly and are the reliable choice "
+            "when two artists share a name. Lines starting with # are ignored.",
+        ),
+        ConfigEntry(
+            key=CONF_AI_BLOCKLIST_URL,
+            type=ConfigEntryType.STRING,
+            label="Blocklist URL (optional)",
+            default_value="",
+            required=False,
+            depends_on=CONF_FILTER_AI_MUSIC,
+            description="Optional: a URL serving a community-maintained list, merged with "
+            "your own entries above. Accepts a JSON array of names or channel ids, a JSON "
+            "object with an 'artists' key, or plain text one per line. Refreshed in the "
+            "background about twice a day; if the URL is unreachable the last good list "
+            "keeps working and nothing is filtered that was not already.",
+        ),
     )
 
 
@@ -463,6 +667,26 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _ytmusic = None
     _yt_dlp_module = None
     _prefer_quality: bool = True
+    # Set from the installed yt-dlp version the first time a stream is
+    # resolved. Defaults to True so the pre-roll wait is on unless a version we
+    # know to be wrong about it is detected: the guard exists to suppress one
+    # bad release range, not to opt in to the fix. See issue #51.
+    _preroll_supported: bool = True
+    # AI-music filter (issue #53). Two sets rather than one, because channel
+    # ids must match exactly while names have to survive spelling drift.
+    _ai_filter_enabled: bool = False
+    _ai_blocklist_url: str = ""
+    _ai_blocked_channel_ids: frozenset[str] = frozenset()
+    _ai_blocked_names: frozenset[str] = frozenset()
+    # Entries typed into the config, kept apart from the fetched ones so a
+    # refresh can replace the remote half without discarding the user's own.
+    _ai_local_channel_ids: frozenset[str] = frozenset()
+    _ai_local_names: frozenset[str] = frozenset()
+    _ai_blocklist_fetched_at: float = 0.0
+    _ai_blocklist_refreshing: bool = False
+    # Holds a reference to the in-flight background refresh so the event loop
+    # does not garbage collect it mid-request.
+    _ai_blocklist_task: object = None
     _authenticated: bool = False
     _auth_lapse_warned: bool = False
     # Per-category flag: True once we've seen a non-empty sync. Used to tell a
@@ -483,6 +707,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # False and pin every instance to the high-quality selector.
         prefer_quality = self.config.get_value(CONF_PREFER_AUDIO_QUALITY)
         self._prefer_quality = True if prefer_quality is None else bool(prefer_quality)
+
+        self._load_ai_filter_config()
+        if self._ai_filter_enabled and self._ai_blocklist_url:
+            # Non-fatal on purpose: an unreachable list must not stop the
+            # provider loading. The local entries are already in effect.
+            await self._refresh_remote_blocklist()
 
         auth_type = self.config.get_value(CONF_AUTH_TYPE) or AUTH_TYPE_NONE
         if auth_type == AUTH_TYPE_COOKIE:
@@ -1158,7 +1388,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 playlist_id,
                 len(tracks_raw),
             )
-        return result
+        return self._drop_ai_tracks(result, f"mix {playlist_id}")
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Return playlist tracks for the given playlist id."""
@@ -1439,7 +1669,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 track = self._parse_track(_normalize_watch_track(track_obj))
                 if track:
                     tracks.append(track)
-        return tracks
+        return self._drop_ai_tracks(tracks, f"song radio for {video_id}")
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return stream details for the given track.
@@ -1454,6 +1684,19 @@ class YoutubeMusicFreeProvider(MusicProvider):
         self.logger.debug(
             "Resolved stream format '%s' for track %s", stream_format.get("format"), video_id
         )
+
+        # Sit out any pre-roll ad window before handing the URL over, because
+        # fetching inside it returns 403 (issue #51). Ahead of the expiration
+        # maths below, so the TTL we report is measured from the moment Music
+        # Assistant actually receives the URL rather than from before the wait.
+        if self._preroll_supported and (wait := _preroll_wait_seconds(stream_format)):
+            self.logger.debug(
+                "Waiting %.1fs for the pre-roll ad window on track %s before "
+                "handing over the stream url",
+                wait,
+                video_id,
+            )
+            await asyncio.sleep(wait)
 
         url = stream_format["url"]
         expiration = DEFAULT_STREAM_URL_EXPIRATION
@@ -1768,7 +2011,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 with suppress(InvalidDataError, KeyError, TypeError):
                     if video_id := content.get("videoId"):
                         track = self._parse_track(content)
-                        if track:
+                        # Filtered per track, so a folder left with nothing is
+                        # dropped by the `if items` check below rather than
+                        # rendering as an empty shelf.
+                        if track and self._drop_ai_tracks([track], f"home feed '{title}'"):
                             items.append(track)
                     elif browse_id := content.get("browseId"):
                         if content.get("subscribers") or content.get("type") == "artist":
@@ -1799,6 +2045,134 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # AI-music filter (issue #53)
+    # ------------------------------------------------------------------
+
+    def _load_ai_filter_config(self) -> None:
+        """Read the filter settings into the sets the hot path consults."""
+        self._ai_filter_enabled = bool(self.config.get_value(CONF_FILTER_AI_MUSIC))
+        self._ai_blocklist_url = str(self.config.get_value(CONF_AI_BLOCKLIST_URL) or "").strip()
+        raw = str(self.config.get_value(CONF_AI_BLOCKLIST) or "")
+        # Commas are accepted alongside newlines because a single-line config
+        # box is what most people will actually be typing into.
+        self._ai_local_channel_ids, self._ai_local_names = _parse_blocklist(
+            raw.replace(",", "\n")
+        )
+        self._ai_blocked_channel_ids = self._ai_local_channel_ids
+        self._ai_blocked_names = self._ai_local_names
+        self._ai_blocklist_fetched_at = 0.0
+        if self._ai_filter_enabled:
+            self.logger.debug(
+                "AI filter enabled with %d local channel ids and %d local names",
+                len(self._ai_local_channel_ids),
+                len(self._ai_local_names),
+            )
+
+    async def _refresh_remote_blocklist(self) -> None:
+        """Fetch the remote list and merge it over the local entries.
+
+        Never raises. A failure leaves whatever is already loaded in place,
+        because the alternative is a filter that quietly empties itself when a
+        community list goes offline, which would look identical to the filter
+        being switched off.
+        """
+        url = self._ai_blocklist_url
+        if not url or self._ai_blocklist_refreshing:
+            return
+        self._ai_blocklist_refreshing = True
+        try:
+            # Imported here rather than at module scope: aiohttp is guaranteed
+            # inside Music Assistant but is not a declared test dependency, and
+            # a module-level import would make the offline suite unrunnable
+            # without it.
+            aiohttp = importlib.import_module("aiohttp")
+            async with self.mass.http_session.get(
+                url, timeout=aiohttp.ClientTimeout(total=AI_BLOCKLIST_TIMEOUT)
+            ) as response:
+                response.raise_for_status()
+                body = await response.text()
+        except Exception as err:  # noqa: BLE001 - any failure means "keep the old list"
+            self.logger.warning(
+                "could not refresh the AI blocklist from %s: %s. Keeping the "
+                "previous list of %d channel ids and %d names.",
+                url,
+                err,
+                len(self._ai_blocked_channel_ids),
+                len(self._ai_blocked_names),
+            )
+            return
+        finally:
+            self._ai_blocklist_refreshing = False
+
+        remote_ids, remote_names = _parse_blocklist(body)
+        if not remote_ids and not remote_names:
+            self.logger.warning(
+                "the AI blocklist at %s parsed to nothing. Either it is empty "
+                "or its format is not one this provider understands; only your "
+                "own entries are in effect.",
+                url,
+            )
+        self._ai_blocked_channel_ids = self._ai_local_channel_ids | remote_ids
+        self._ai_blocked_names = self._ai_local_names | remote_names
+        self._ai_blocklist_fetched_at = time.time()
+        self.logger.debug(
+            "AI blocklist refreshed from %s: %d channel ids, %d names in total",
+            url,
+            len(self._ai_blocked_channel_ids),
+            len(self._ai_blocked_names),
+        )
+
+    def _schedule_blocklist_refresh_if_stale(self) -> None:
+        """Kick off a background refresh when the fetched list has aged out.
+
+        Fire and forget. The caller is on the path that builds a queue, so it
+        uses the list it already has and picks up the new one next time round.
+        """
+        if not self._ai_filter_enabled or not self._ai_blocklist_url:
+            return
+        if self._ai_blocklist_refreshing:
+            return
+        if time.time() - self._ai_blocklist_fetched_at < AI_BLOCKLIST_TTL:
+            return
+        with suppress(RuntimeError):
+            # RuntimeError when there is no running loop, which only happens in
+            # tests driving these helpers synchronously.
+            task = asyncio.get_running_loop().create_task(self._refresh_remote_blocklist())
+            # Keep a reference so the task is not garbage collected mid-flight.
+            self._ai_blocklist_task = task
+
+    def _is_ai_blocked(self, track: Track) -> bool:
+        """Whether ``track`` is by an artist on the blocklist."""
+        for artist in track.artists or ():
+            artist_id = getattr(artist, "item_id", None)
+            if artist_id and artist_id in self._ai_blocked_channel_ids:
+                return True
+            name = getattr(artist, "name", None)
+            if name and _normalize_artist_name(name) in self._ai_blocked_names:
+                return True
+        return False
+
+    def _drop_ai_tracks(self, tracks: list[Track], source: str) -> list[Track]:
+        """Remove blocklisted tracks from an auto-generated list.
+
+        Applied only to lists YouTube generated for us (radio, mixes, similar
+        tracks, recommendations). Search, library and hand-picked playlists are
+        left alone: filtering those would make a deliberate lookup fail to find
+        something the user explicitly asked for.
+        """
+        if not self._ai_filter_enabled:
+            return tracks
+        if not self._ai_blocked_channel_ids and not self._ai_blocked_names:
+            return tracks
+        self._schedule_blocklist_refresh_if_stale()
+        kept = [track for track in tracks if not self._is_ai_blocked(track)]
+        if dropped := len(tracks) - len(kept):
+            self.logger.debug(
+                "AI filter removed %d of %d tracks from %s", dropped, len(tracks), source
+            )
+        return kept
+
     async def _get_stream_format(self, item_id: str) -> dict[str, Any]:
         """Extract the best audio stream URL via yt-dlp (no cookies required)."""
 
@@ -1810,6 +2184,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
             if self._yt_dlp_module is None:
                 self._yt_dlp_module = importlib.import_module("yt_dlp")
             yt_dlp = self._yt_dlp_module
+
+            # Decided here rather than at the call site because this is the only
+            # place the module is guaranteed to be imported.
+            self._preroll_supported = _ytdlp_honours_preroll(
+                getattr(getattr(yt_dlp, "version", None), "__version__", None)
+            )
 
             url = f"{YTM_DOMAIN}/watch?v={video_id}"
             ydl_opts = {
