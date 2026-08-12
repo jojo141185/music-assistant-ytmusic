@@ -193,10 +193,31 @@ LEGACY_AUTH_FILE = "/data/ytmusic_browser_auth.json"
 # or hours later, with no obvious error to the user. See issue #6.
 RECOMMENDED_AUTH_COOKIES = ("__Secure-1PSID", "__Secure-3PSID", "SAPISID")
 
-# Substrings in exception messages that suggest an auth lapse (vs. a transient
-# network or parsing error). ytmusicapi surfaces httpx.HTTPStatusError with the
-# response status in the message, so plain substring matching is sufficient.
-AUTH_LAPSE_ERROR_MARKERS = ("401", "Unauthorized")
+# Patterns in exception messages that suggest an auth lapse, as opposed to a
+# transient network or parsing error. ytmusicapi surfaces httpx.HTTPStatusError
+# with the response status in the message.
+#
+# A bare "401" substring was too loose: it matched any message that happened to
+# contain those digits anywhere, and the strings we pass through here routinely
+# carry video ids and track titles. "Error 401 while fetching abc401xyz" and
+# "no formats for video 4012ab" were indistinguishable, so an ordinary
+# extraction failure could be reported to the user as an expired cookie. Anchor
+# the status to how an HTTP error actually spells it instead.
+# 403 is deliberately absent. It has its own meaning here (the owned-playlist
+# no-op path) and reporting it as an expired cookie would send people to
+# re-capture a cookie that is fine.
+AUTH_LAPSE_ERROR_PATTERN = re.compile(
+    r"(?:\b401\s+(?:Client\s+)?Error\b"
+    r"|\bstatus[_ ]code[=: ]+401\b"
+    r"|\bHTTP\s+401\b"
+    r"|\bUnauthorized\b"
+    r"|\bnot\s+authenticated\b"
+    r"|\bauthentication\s+(?:failed|required)\b"
+    # ytmusicapi's own wording when the client has no credentials at all
+    # (YTMusic._check_auth raises YTMusicUserError with exactly this text).
+    r"|\bprovide\s+authentication\b)",
+    re.IGNORECASE,
+)
 
 # Music Assistant's core search controller sanitizes the query before handing it
 # to a provider, replacing every "/" with a space and stripping "'"
@@ -764,8 +785,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     self._ytmusic = await asyncio.to_thread(
                         self._create_ytmusic_client, auth=auth_headers, user=brand_account
                     )
-                    # Validate auth by making a lightweight library call
-                    await asyncio.to_thread(self._ytmusic.get_library_songs, limit=1)
+                    # Validate auth by making a lightweight library call.
+                    #
+                    # "Did it raise" is not enough on its own. A lapsed YouTube
+                    # session does not answer 401: it answers HTTP 200 with a
+                    # logged-out payload, which ytmusicapi unwraps to []. So the
+                    # call below succeeds, and before this check the provider
+                    # logged "library sync enabled" over a cookie that was
+                    # already dead. That reassuring line was the reporter's
+                    # first clue in issue #55 that something was wrong with the
+                    # logging rather than with their troubleshooting.
+                    songs = await asyncio.to_thread(
+                        self._ytmusic.get_library_songs, limit=1
+                    )
+                    if not songs and await asyncio.to_thread(
+                        self._probe_session_alive
+                    ) is False:
+                        raise RuntimeError(
+                            "the cookie was accepted but the account is not "
+                            "signed in (YouTube answers a lapsed session with "
+                            "an empty library rather than an auth error)"
+                        )
                     self._authenticated = True
                     self._auth_lapse_warned = False
                     self.logger.info(
@@ -1833,8 +1873,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     def _is_auth_lapse(self, err: Exception) -> bool:
         """Return True if the error looks like an expired or invalid cookie."""
-        err_str = str(err)
-        return any(marker in err_str for marker in AUTH_LAPSE_ERROR_MARKERS)
+        return bool(AUTH_LAPSE_ERROR_PATTERN.search(str(err)))
 
     def _probe_session_alive(self) -> bool | None:
         """Best-effort check that the ytmusicapi session is still authenticated.
@@ -1871,22 +1910,77 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self._library_seen_nonempty[category] = True
         return prev
 
-    async def _guard_partial_auth_empty(self, category: str, count: int) -> None:
-        """Raise on a suspected partial-auth empty sync to preserve MA's library cache.
+    async def _require_library_auth(self, category: str) -> None:
+        """Fail a library sync we cannot vouch for, rather than reporting it empty.
 
-        Only fires when the category was previously populated and the current
-        sync came back empty, then a side-channel probe confirms the session
-        is no longer authenticated.
+        Music Assistant treats a completed sync as authoritative. Anything it
+        previously held for this provider and did not see this round is dropped
+        from the library, and any item left with no provider claiming it is
+        unfavourited (``sync_library`` in its ``MusicProvider`` base). So
+        yielding nothing is not a neutral "no data": it is an instruction to
+        delete.
+
+        The provider declares the library features unconditionally at setup, so
+        a failed or lapsed cookie does not stop Music Assistant asking. Before
+        this guard the library methods answered that question with a silent
+        early return, which is why a cookie going stale emptied someone's
+        favourites rather than just failing to refresh them. Issue #55.
+
+        Genuinely anonymous instances are exempt: they have no library, never
+        had one, and nothing of theirs is waiting to be deleted.
         """
-        previously_populated = self._record_library_count(category, count)
-        if count > 0 or not previously_populated:
+        if self._authenticated:
             return
-        alive = await asyncio.to_thread(self._probe_session_alive)
-        if alive is not False:
+        auth_type = (self.config.get_value(CONF_AUTH_TYPE) if self.config else None) or (
+            AUTH_TYPE_NONE
+        )
+        if auth_type != AUTH_TYPE_COOKIE:
             return
         err = RuntimeError(
-            "Library returned empty but session probe reports Unauthorized "
-            "(suspected partial-auth lapse, issue #10)"
+            "Cookie authentication is configured but not active, so the library "
+            "cannot be read. Failing this sync on purpose: reporting an empty "
+            "library would make Music Assistant delete the items it already has "
+            "(issue #55). Refresh the cookie on the provider config page."
+        )
+        self._warn_library_error(f"get_library_{category}", err)
+        raise err
+
+    async def _guard_partial_auth_empty(self, category: str, count: int) -> None:
+        """Raise on a suspected partial-auth empty sync to preserve MA's library.
+
+        Fires whenever a sync comes back empty and a side-channel probe confirms
+        the session is no longer authenticated.
+
+        It used to also require the category to have been seen populated earlier
+        in this process. That state lives in ``_library_seen_nonempty``, which is
+        in memory and reset by ``handle_async_init``, so after any restart every
+        category read as "never populated" and the guard returned before probing
+        anything. A lapsed cookie plus a restart therefore looked exactly like a
+        genuinely empty library, which is the shape of issue #55. The probe is
+        one request and only runs when a sync returned nothing, which is rare
+        enough that its cost is irrelevant next to wiping someone's library.
+        """
+        self._record_library_count(category, count)
+        if count > 0:
+            return
+        alive = await asyncio.to_thread(self._probe_session_alive)
+        if alive is None:
+            # Undetermined. Accept the empty result rather than failing every
+            # genuinely empty library whenever the probe is unavailable, but say
+            # so, because this is the one path that can still lose items.
+            self.logger.warning(
+                "get_library_%s returned nothing and the session probe was "
+                "inconclusive. Treating the empty library as genuine. If items "
+                "disappear from Music Assistant after this, the cookie has "
+                "most likely lapsed and needs refreshing.",
+                category,
+            )
+            return
+        if alive:
+            return
+        err = RuntimeError(
+            "Library returned empty but the session probe reports the account "
+            "is not signed in (suspected cookie lapse, issues #10 and #55)"
         )
         self._warn_library_error(f"get_library_{category}", err)
         raise err
@@ -1913,6 +2007,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get artists from the user's library (subscriptions + library artists)."""
 
         if not self._authenticated:
+            await self._require_library_auth("artists")
             return
         subs: list[dict] = []
         lib_artists: list[dict] = []
@@ -1951,6 +2046,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get albums from the user's library."""
 
         if not self._authenticated:
+            await self._require_library_auth("albums")
             return
         try:
             results = await asyncio.to_thread(
@@ -1968,6 +2064,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get tracks from the user's library."""
 
         if not self._authenticated:
+            await self._require_library_auth("tracks")
             return
         try:
             results = await asyncio.to_thread(
@@ -1987,6 +2084,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """Get playlists from the user's library."""
 
         if not self._authenticated:
+            await self._require_library_auth("playlists")
             return
         try:
             results = await asyncio.to_thread(
