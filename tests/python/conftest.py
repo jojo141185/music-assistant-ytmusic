@@ -380,6 +380,34 @@ def _install_music_assistant() -> None:
     models.music_provider = music_provider_mod
     pkg.models = models
 
+    controllers = _new_module("music_assistant.controllers")
+    cache_mod = _new_module("music_assistant.controllers.cache")
+
+    def _use_cache(expiration=600, **kwargs):
+        """Pass-through stand-in for Music Assistant's ``use_cache``.
+
+        Deliberately does no caching. The real decorator needs ``self.mass.cache``,
+        which the unit suite does not have, and every other test here wants the
+        undecorated behaviour anyway. What it does do is record the arguments on
+        the wrapped function, so a test can assert the decorator is applied with
+        the intended lifetime rather than merely that the code still runs.
+        """
+        import functools
+
+        def _decorator(func):
+            @functools.wraps(func)
+            async def _wrapper(*args, **fn_kwargs):
+                return await func(*args, **fn_kwargs)
+
+            _wrapper.__ma_cache__ = {"expiration": expiration, **kwargs}
+            return _wrapper
+
+        return _decorator
+
+    cache_mod.use_cache = _use_cache
+    controllers.cache = cache_mod
+    pkg.controllers = controllers
+
 
 _install_music_assistant_models()
 _install_music_assistant()

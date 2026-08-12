@@ -2370,6 +2370,65 @@ def test_search_results_are_never_filtered(provider):
     assert [t.name for t in results.tracks] == ["Slop"]
 
 
+# ---------------------------------------------------------------------------
+# Playlist track caching (issue #56)
+#
+# Auto-generated mixes come from the watch endpoint, which regenerates the list
+# on every call: two consecutive requests for the same song radio returned 147
+# tracks each with no overlap. Uncached, that meant a playlist whose contents
+# changed every time it was rendered, and a request to YouTube per render.
+# ---------------------------------------------------------------------------
+
+
+def test_playlist_tracks_are_cached_with_a_short_lifetime():
+    """Binds the decorator, not just that the method still runs.
+
+    Without an assertion on the recorded arguments, removing the decorator
+    entirely would leave every other test green, because the stub in
+    conftest.py is a pass-through by design.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    cache_args = getattr(YoutubeMusicFreeProvider.get_playlist_tracks, "__ma_cache__", None)
+    assert cache_args is not None, (
+        "get_playlist_tracks is no longer cached; browsing a mix will re-roll "
+        "it on every render again (issue #56)"
+    )
+    assert cache_args["expiration"] == ytm.PLAYLIST_TRACKS_CACHE_TTL
+    assert cache_args.get("allow_expired_cache") is True, (
+        "without stale-while-revalidate an expiry blocks the browse on a "
+        "fresh fetch instead of serving the previous list"
+    )
+
+
+def test_playlist_cache_ttl_is_short_enough_to_still_turn_over():
+    """A mix that refreshes once a week is not a dynamic playlist.
+
+    Long enough that browsing twice shows the same thing, short enough that
+    the list still changes over a day.
+    """
+    assert 600 <= ytm.PLAYLIST_TRACKS_CACHE_TTL <= 6 * 3600
+
+
+def test_cached_playlist_tracks_still_reach_the_caller(provider):
+    """The decorator must not swallow or reshape the result."""
+    mock = MagicMock()
+    mock.get_watch_playlist.return_value = {
+        "tracks": [
+            {
+                "videoId": "vid00000001",
+                "title": "Good",
+                "artists": [{"name": "Real Band", "id": "UC000000000000000000000b"}],
+            }
+        ]
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_playlist_tracks("RDdQw4w9WgXcQ"))
+
+    assert [t.name for t in tracks] == ["Good"]
+
+
 def test_get_album_raises_when_not_found(provider):
     mock = MagicMock()
     mock.get_album = MagicMock(return_value=None)

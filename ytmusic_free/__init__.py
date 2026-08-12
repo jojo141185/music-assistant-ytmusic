@@ -57,6 +57,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.util import infer_album_type, install_package, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
@@ -110,6 +111,14 @@ MIN_YTDLP_VERSION_FOR_PREROLL = (2025, 12, 8)
 # duplicate some tracks and skip others. get_playlist_tracks accordingly
 # returns nothing for page > 0.
 RADIO_PLAYLIST_LIMIT = 100
+
+# How long a playlist's track list is reused before it is fetched again.
+# Short, because the whole point is that auto-generated mixes change: long
+# enough that browsing one twice shows the same thing, short enough that it
+# still turns over during a day. Music Assistant bypasses this entirely for
+# playback and refill, so it only ever affects what you are looking at, never
+# what you are hearing. Same figure the official ytmusic provider uses.
+PLAYLIST_TRACKS_CACHE_TTL = 3 * 3600
 
 # Features that work without a YTM account
 BASE_FEATURES = {
@@ -1419,8 +1428,26 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
         return self._drop_ai_tracks(result, f"mix {playlist_id}")
 
+    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
-        """Return playlist tracks for the given playlist id."""
+        """Return playlist tracks for the given playlist id.
+
+        Cached, and the reason is the opposite of what it looks like. Nothing
+        here was ever cached, so every browse of a mix re-rolled it: the watch
+        endpoint hands back a freshly generated list on each call, measured at
+        147 tracks with no overlap between two consecutive requests. A list
+        that changes every time you look at it is not a playlist, and it also
+        meant a request to YouTube for every render.
+
+        The three-hour window makes a mix stable enough to read, and Music
+        Assistant bypasses it where freshness actually matters: playback and
+        refill pass ``force_refresh``, which sets the bypass context variable
+        ``use_cache`` honours, so a dynamic playlist still yields new tracks
+        when it is played rather than browsed. ``allow_expired_cache`` serves
+        the stale list immediately and refreshes behind it, so an expiry never
+        shows up as a spinner. Matches the official ytmusic provider. See
+        issue #56.
+        """
         if page > 0:
             return []
         # Only ids that nothing else will answer for go to the radio endpoint
