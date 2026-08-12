@@ -91,6 +91,18 @@ def test_media_type_has_the_members_the_provider_uses(real_models):
     assert not missing, f"upstream MediaType lost members the provider uses: {missing}"
 
 
+def test_item_mapping_exposes_the_fields_the_provider_sets(real_models):
+    """``year`` in particular: the album-year feature depends on it existing.
+
+    A track's album arrives as an id and a name only, so the provider looks the
+    year up and assigns it here. If upstream drops the field that assignment
+    would silently go nowhere. See issue #53.
+    """
+    fields = {f.name for f in dataclasses.fields(real_models.media_items.ItemMapping)}
+    missing = set(ma_contract.REQUIRED_ITEM_MAPPING_FIELDS) - fields
+    assert not missing, f"upstream ItemMapping lost fields the provider sets: {missing}"
+
+
 def test_podcast_exposes_the_fields_the_provider_sets(real_models):
     fields = {f.name for f in dataclasses.fields(real_models.media_items.Podcast)}
     missing = set(ma_contract.REQUIRED_PODCAST_FIELDS) - fields

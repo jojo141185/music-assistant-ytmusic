@@ -2803,6 +2803,227 @@ def test_library_podcasts_counts_real_shows_for_the_empty_guard(provider):
         _consume(provider.get_library_podcasts())
 
 
+# ---------------------------------------------------------------------------
+# Metadata cache and album year (issue #53)
+#
+# A track parsed from a playlist or search carries only {"id", "name"} for its
+# album, so the release year has to be looked up. That is only affordable
+# because the album lookup is cached for a month.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "ttl_attr"),
+    [
+        ("get_album", "CATALOG_CACHE_TTL"),
+        ("get_album_tracks", "CATALOG_CACHE_TTL"),
+        ("get_track", "CATALOG_CACHE_TTL"),
+        ("get_artist", "ARTIST_CACHE_TTL"),
+        ("get_artist_albums", "ARTIST_CACHE_TTL"),
+        ("get_artist_toptracks", "ARTIST_CACHE_TTL"),
+        ("get_similar_tracks", "SIMILAR_TRACKS_CACHE_TTL"),
+        ("get_playlist", "PLAYLIST_TRACKS_CACHE_TTL"),
+    ],
+)
+def test_metadata_lookups_are_cached(method, ttl_attr):
+    """Every repeated catalogue lookup is cached.
+
+    Without this the provider made a request per render, which is the
+    bot-detection exposure raised in issue #53 and what made the album-year
+    lookup unaffordable.
+    """
+    from ytmusic_free import YoutubeMusicFreeProvider
+
+    args = getattr(getattr(YoutubeMusicFreeProvider, method), "__ma_cache__", None)
+    assert args is not None, f"{method} is not cached"
+    assert args["expiration"] == getattr(ytm, ttl_attr)
+    assert args.get("allow_expired_cache") is True
+
+
+def test_similar_tracks_cache_is_shorter_than_the_catalog_one():
+    """Song radio is meant to differ each time; an album's year is not."""
+    assert ytm.SIMILAR_TRACKS_CACHE_TTL < ytm.CATALOG_CACHE_TTL
+
+
+def _track_with_album(provider, album_id="MPREb_x", year=None):
+    track = ytm.Track(item_id="v1", provider="ytmusic_free", name="A Song")
+    track.album = provider._get_item_mapping(MediaType.ALBUM, album_id, "An Album", year)
+    return track
+
+
+def test_item_mapping_carries_a_year_when_given_one(provider):
+    mapping = provider._get_item_mapping(MediaType.ALBUM, "MPREb_x", "An Album", 1998)
+    assert mapping.year == 1998
+
+
+def test_item_mapping_year_defaults_to_none(provider):
+    """Unknown must stay distinguishable from a real year."""
+    mapping = provider._get_item_mapping(MediaType.ALBUM, "MPREb_x", "An Album")
+    assert mapping.year is None
+
+
+def test_album_tracks_carry_the_album_year_without_a_lookup(provider):
+    """The album is already in hand here, so the year is free."""
+    mock = MagicMock()
+    mock.get_album.return_value = {
+        "title": "An Album",
+        "year": "1998",
+        "tracks": [{"videoId": "v1", "title": "One", "artists": [{"name": "A", "id": "UCa"}]}],
+    }
+    provider._ytmusic = mock
+
+    tracks = asyncio.run(provider.get_album_tracks("MPREb_x"))
+
+    assert [t.album.year for t in tracks] == [1998]
+    assert mock.get_album.call_count == 1
+
+
+def test_attach_album_years_fills_the_year_from_one_lookup_per_album(provider):
+    tracks = [_track_with_album(provider), _track_with_album(provider)]
+    calls = []
+
+    async def _get_album(album_id):
+        calls.append(album_id)
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 1998
+        return album
+
+    provider.get_album = _get_album
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert [t.album.year for t in tracks] == [1998, 1998]
+    assert calls == ["MPREb_x"], "two tracks on one album must cost one lookup"
+
+
+def test_attach_album_years_skips_albums_that_already_have_one(provider):
+    tracks = [_track_with_album(provider, year=1998)]
+    provider.get_album = MagicMock(side_effect=AssertionError("must not be called"))
+    asyncio.run(provider._attach_album_years(tracks))
+    assert tracks[0].album.year == 1998
+
+
+def test_attach_album_years_ignores_tracks_with_no_album(provider):
+    """Radio tracks arrive with album=None, so there is nothing to look up."""
+    track = ytm.Track(item_id="v1", provider="ytmusic_free", name="A Song")
+    track.album = None
+    provider.get_album = MagicMock(side_effect=AssertionError("must not be called"))
+    asyncio.run(provider._attach_album_years([track]))
+
+
+def test_attach_album_years_survives_a_failed_lookup(provider):
+    """A missing year must never fail the playlist it came from."""
+    tracks = [_track_with_album(provider)]
+
+    async def _boom(album_id):
+        raise RuntimeError("album lookup failed")
+
+    provider.get_album = _boom
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert tracks[0].album.year is None
+
+
+def test_attach_album_years_is_capped(provider):
+    """One pathological playlist must not become hundreds of requests."""
+    tracks = [
+        _track_with_album(provider, album_id=f"MPREb_{i}")
+        for i in range(ytm.ALBUM_YEAR_LOOKUP_LIMIT + 15)
+    ]
+    calls = []
+
+    async def _get_album(album_id):
+        calls.append(album_id)
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 2001
+        return album
+
+    provider.get_album = _get_album
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert len(calls) == ytm.ALBUM_YEAR_LOOKUP_LIMIT
+    filled = [t for t in tracks if t.album.year is not None]
+    assert len(filled) == ytm.ALBUM_YEAR_LOOKUP_LIMIT
+
+
+def test_attach_album_years_bounds_concurrency(provider):
+    """A cold cache must not arrive as a burst of parallel requests."""
+    in_flight = 0
+    peak = 0
+
+    async def _get_album(album_id):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 2001
+        return album
+
+    provider.get_album = _get_album
+    tracks = [_track_with_album(provider, album_id=f"MPREb_{i}") for i in range(20)]
+    asyncio.run(provider._attach_album_years(tracks))
+
+    assert peak <= ytm.ALBUM_YEAR_LOOKUP_CONCURRENCY
+
+
+def test_playlist_tracks_get_their_album_year(provider):
+    """The path da-anda's queue filter actually reads from (issue #53)."""
+    mock = MagicMock()
+    mock.get_playlist.return_value = {
+        "id": "PLabc123",
+        "title": "A Playlist",
+        "tracks": [
+            {
+                "videoId": "v1",
+                "title": "One",
+                "artists": [{"name": "A", "id": "UCa"}],
+                "album": {"id": "MPREb_x", "name": "An Album"},
+            }
+        ],
+    }
+    provider._ytmusic = mock
+
+    async def _get_album(album_id):
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 1998
+        return album
+
+    provider.get_album = _get_album
+
+    tracks = asyncio.run(provider.get_playlist_tracks("PLabc123"))
+
+    assert [t.album.year for t in tracks] == [1998], (
+        "playlist tracks reached Music Assistant without a release year, which "
+        "is the gap issue #53 reported"
+    )
+
+
+def test_search_tracks_get_their_album_year(provider):
+    mock = MagicMock()
+    mock.search.return_value = [
+        {
+            "resultType": "song",
+            "videoId": "v1",
+            "title": "One",
+            "artists": [{"name": "A", "id": "UCa"}],
+            "album": {"id": "MPREb_x", "name": "An Album"},
+        }
+    ]
+    provider._ytmusic = mock
+
+    async def _get_album(album_id):
+        album = ytm.Album(item_id=album_id, provider="ytmusic_free", name="An Album")
+        album.year = 2004
+        return album
+
+    provider.get_album = _get_album
+
+    results = asyncio.run(provider.search("one", [MediaType.TRACK]))
+
+    assert [t.album.year for t in results.tracks] == [2004]
+
+
 def test_get_album_raises_when_not_found(provider):
     mock = MagicMock()
     mock.get_album = MagicMock(return_value=None)

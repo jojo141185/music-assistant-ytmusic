@@ -122,6 +122,26 @@ RADIO_PLAYLIST_LIMIT = 100
 # what you are hearing. Same figure the official ytmusic provider uses.
 PLAYLIST_TRACKS_CACHE_TTL = 3 * 3600
 
+# Catalogue metadata: an album's title, artwork and release year do not change
+# after it is published, and an artist's discography changes a few times a year
+# at most. Long lifetimes here are what make the album-year lookup below
+# affordable, and they cut the request volume that raises the bot-detection risk
+# raised in issue #53. Same figures the official ytmusic provider uses.
+CATALOG_CACHE_TTL = 30 * 24 * 3600
+ARTIST_CACHE_TTL = 7 * 24 * 3600
+
+# Song radio is meant to differ each time it is asked for, so it gets a short
+# window: long enough that paging through a queue is stable, short enough that
+# asking again tomorrow gives you different music.
+SIMILAR_TRACKS_CACHE_TTL = 24 * 3600
+
+# Album lookups run to fill in release years on tracks that only carry an album
+# id. Bounded on both axes: at most this many at once, so a cold cache does not
+# arrive as a burst of parallel requests, and never more than this many distinct
+# albums per call, so one pathological playlist cannot turn into hundreds.
+ALBUM_YEAR_LOOKUP_CONCURRENCY = 4
+ALBUM_YEAR_LOOKUP_LIMIT = 40
+
 # Features that work without a YTM account
 BASE_FEATURES = {
     ProviderFeature.SEARCH,
@@ -1160,6 +1180,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             except (InvalidDataError, KeyError, TypeError):
                 pass  # skip invalid items
 
+        await self._attach_album_years(parsed_results.tracks)
         return parsed_results
 
     @classmethod
@@ -1326,6 +1347,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 )
         return results
 
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id.
 
@@ -1379,6 +1401,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         track.version = f"{track.version} [{trim_label}]".strip() if track.version else f"[{trim_label}]"
         return track
 
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
@@ -1386,15 +1409,22 @@ class YoutubeMusicFreeProvider(MusicProvider):
             raise MediaNotFoundError(f"Album {prov_album_id} not found")
         return self._parse_album(album_obj, prov_album_id)
 
+    @use_cache(CATALOG_CACHE_TTL, allow_expired_cache=True)
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
         album_obj = await asyncio.to_thread(self._ytmusic.get_album, prov_album_id)
         if not album_obj or not album_obj.get("tracks"):
             return []
+        album = self._parse_album(album_obj, prov_album_id)
         tracks = []
         for track_number, track_obj in enumerate(album_obj["tracks"], 1):
             with suppress(InvalidDataError, KeyError, TypeError):
                 track = self._parse_track(track_obj, track_number=track_number)
+                # Free here: the album this track came from is already in hand,
+                # year and all, so there is nothing to look up.
+                track.album = self._get_item_mapping(
+                    MediaType.ALBUM, album.item_id, album.name, album.year
+                )
                 tracks.append(track)
         return tracks
 
@@ -1424,6 +1454,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             self.logger.debug("get_artist failed for %s: %s", prov_artist_id, err)
             return None
 
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
         # Fake IDs created when artist channel ID is unknown — return a stub
@@ -1456,6 +1487,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except Exception as e:
             raise MediaNotFoundError(f"Artist {prov_artist_id} not found") from e
 
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -1471,6 +1503,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 albums.append(self._parse_album(album_obj, album_obj.get("browseId")))
         return albums
 
+    @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get a list of most popular tracks for the given artist."""
         artist_obj = await self._fetch_artist_obj(prov_artist_id)
@@ -1579,6 +1612,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
             podcast_id or episode_obj.get("playlistId") or "unknown",
         )
 
+    @use_cache(PLAYLIST_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get full playlist details by id."""
         try:
@@ -1753,7 +1787,8 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     prov_playlist_id, seed
                 )
                 if len(ytdlp_result) > len(result):
-                    return self._merge_playlist_track_results(result, ytdlp_result)
+                    result = self._merge_playlist_track_results(result, ytdlp_result)
+            await self._attach_album_years(result)
             return result
         except (MediaNotFoundError, UnplayableMediaError):
             raise
@@ -1954,6 +1989,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 pass
         return result
 
+    @use_cache(SIMILAR_TRACKS_CACHE_TTL, allow_expired_cache=True)
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Return a dynamic list of tracks based on the provided track (song radio).
 
@@ -3076,13 +3112,70 @@ class YoutubeMusicFreeProvider(MusicProvider):
             )
         return result
 
-    def _get_item_mapping(self, media_type: MediaType, key: str, name: str) -> ItemMapping:
-        return ItemMapping(
+    def _get_item_mapping(
+        self, media_type: MediaType, key: str, name: str, year: int | None = None
+    ) -> ItemMapping:
+        mapping = ItemMapping(
             media_type=media_type,
             item_id=key,
             provider=self.instance_id,
             name=name,
         )
+        if year is not None:
+            # Upstream ItemMapping carries a year; this provider never set one,
+            # so an album reached through a track had no release year at all.
+            # Issue #53.
+            mapping.year = year
+        return mapping
+
+    async def _attach_album_years(self, tracks: list[Track]) -> None:
+        """Fill in the release year on each track's album, in place.
+
+        A track parsed from a playlist or a search result carries only
+        ``{"id", "name"}`` for its album, so the year has to come from an album
+        lookup. That is only affordable because ``get_album`` is cached for a
+        month: in steady state this costs nothing, and a cold cache costs one
+        request per distinct album rather than one per track.
+
+        Bounded on both axes. Concurrency is capped so a cold cache does not
+        arrive as a burst, and the number of distinct albums is capped so one
+        pathological playlist cannot become hundreds of requests. Past the cap
+        the remaining tracks simply keep a year of None, which is what they had
+        before this existed.
+
+        Never raises: a year is a nice-to-have, and failing a playlist load over
+        one is a bad trade. Requested in issue #53.
+        """
+        wanted: dict[str, list[ItemMapping]] = {}
+        for track in tracks:
+            album = getattr(track, "album", None)
+            album_id = getattr(album, "item_id", None)
+            if album_id and getattr(album, "year", None) is None:
+                wanted.setdefault(album_id, []).append(album)
+        if not wanted:
+            return
+
+        album_ids = list(wanted)[:ALBUM_YEAR_LOOKUP_LIMIT]
+        if len(wanted) > ALBUM_YEAR_LOOKUP_LIMIT:
+            self.logger.debug(
+                "album-year lookup capped at %d of %d distinct albums",
+                ALBUM_YEAR_LOOKUP_LIMIT,
+                len(wanted),
+            )
+        semaphore = asyncio.Semaphore(ALBUM_YEAR_LOOKUP_CONCURRENCY)
+
+        async def _fill(album_id: str) -> None:
+            async with semaphore:
+                try:
+                    album = await self.get_album(album_id)
+                except Exception as err:  # noqa: BLE001 - a missing year is not an error
+                    self.logger.debug("album-year lookup failed for %s: %s", album_id, err)
+                    return
+            if album.year:
+                for mapping in wanted[album_id]:
+                    mapping.year = album.year
+
+        await asyncio.gather(*(_fill(album_id) for album_id in album_ids))
 
     def _get_artist_item_mapping(self, artist_obj: dict) -> ItemMapping:
         # search results (filter="artists") key the id as "browseId" and the

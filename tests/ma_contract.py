@@ -83,6 +83,17 @@ REQUIRED_MEDIA_TYPE_MEMBERS: tuple[str, ...] = (
     "PODCAST_EPISODE",
 )
 
+# ``ItemMapping`` fields the provider sets. ``year`` is the one that matters:
+# the album-year feature in issue #53 exists only because upstream carries it,
+# and if it ever disappears the provider would be assigning to nothing.
+REQUIRED_ITEM_MAPPING_FIELDS: tuple[str, ...] = (
+    "media_type",
+    "item_id",
+    "provider",
+    "name",
+    "year",
+)
+
 # ``Podcast`` fields the provider sets.
 REQUIRED_PODCAST_FIELDS: tuple[str, ...] = (
     "item_id",

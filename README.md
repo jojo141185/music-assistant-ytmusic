@@ -295,6 +295,12 @@ playlist links.)
 - Ensure you are on the latest version of this provider (playlist support uses a yt-dlp fallback added after the initial release).
 - Very large playlists may take a few seconds to load as yt-dlp fetches the track list.
 
+**Album release years, and how often this provider calls YouTube**
+- Catalogue lookups (albums, artists, tracks, playlists) are cached: albums and tracks for 30 days, artists for 7, song radio for 1 day, playlists for 3 hours. Nothing about a released album changes, and the previous behaviour of re-fetching on every render was both slow and a good way to get rate-limited.
+- Tracks now carry their album's release year. A track from a playlist or a search only tells us its album's id and name, so the year comes from an album lookup, which is affordable only because of the cache above: in steady state it costs nothing, and a cold cache costs one request per album rather than one per track. Bounded to 40 albums per call, 4 at a time.
+- **Radio and mix tracks have no album at all** in YouTube's response, so they get no year. Nothing can be cached or looked up to change that.
+- The year is the year of the *album entry the track was surfaced under*, not of the recording. A 1998 song on a 2025 compilation reads as 2025. Requested in [#53](https://github.com/sproft/music-assistant-ytmusic/issues/53).
+
 **Mixes look different every time I open them**
 - Fixed in current versions. Auto-generated playlists (My Supermix, Discover Mix, song radio) come from YouTube's watch endpoint, which builds a new list on every request: two consecutive calls for the same mix returned 147 tracks each with nothing in common. Nothing was cached, so the playlist you were looking at was regenerated on each render, and every render cost a request to YouTube.
 - The track list is now reused for three hours, so a mix stays put while you browse it. Playback is unaffected: Music Assistant asks for fresh tracks when it fills a queue, which bypasses the cache, so a dynamic playlist still gives you new music when you play it rather than when you look at it. Background: [#56](https://github.com/sproft/music-assistant-ytmusic/issues/56).

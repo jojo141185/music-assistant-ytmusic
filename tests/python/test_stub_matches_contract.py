@@ -24,7 +24,12 @@ from music_assistant_models.enums import ContentType, MediaType
 
 # Imported from media_items, not streamdetails, because that is the path the
 # provider itself uses. Upstream re-exports the same class from both.
-from music_assistant_models.media_items import AudioFormat, Podcast, PodcastEpisode
+from music_assistant_models.media_items import (
+    AudioFormat,
+    ItemMapping,
+    Podcast,
+    PodcastEpisode,
+)
 from music_assistant_models.streamdetails import StreamDetails
 
 TESTS_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +95,12 @@ def test_stub_media_type_has_the_required_members():
         name for name in ma_contract.REQUIRED_MEDIA_TYPE_MEMBERS if not hasattr(MediaType, name)
     ]
     assert not missing, f"stub MediaType is missing {missing}; see tests/ma_contract.py"
+
+
+def test_stub_item_mapping_has_the_required_fields():
+    fields = {f.name for f in dataclasses.fields(ItemMapping)}
+    missing = set(ma_contract.REQUIRED_ITEM_MAPPING_FIELDS) - fields
+    assert not missing, f"stub ItemMapping is missing {missing}"
 
 
 def test_stub_podcast_has_the_required_fields():
