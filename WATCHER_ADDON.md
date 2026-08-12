@@ -115,7 +115,7 @@ ENTRYPOINT ["/run.sh"]
 ```bash
 #!/usr/bin/env bash
 
-MA="addon_d5369777_music_assistant"
+MA="app_d5369777_music_assistant"
 SRC="/provider/ytmusic_free"
 DST="/app/venv/lib/python3.13/site-packages/music_assistant/providers"
 
@@ -158,11 +158,14 @@ while true; do
 done
 ```
 
-> **Note:** If your MA add-on ID differs from `addon_d5369777_music_assistant`, update the `MA=` line.
-> Check with: `docker ps | grep music`
+> **Note:** Supervisor renamed add-on containers from `addon_*` to `app_*`, so the right value for `MA=` depends on your Supervisor version. Check with:
+> ```bash
+> docker ps --format '{{.Names}}' | grep music_assistant
+> ```
+> The `run.sh` the installer generates re-detects this at runtime and adapts if the name it was given is not there, which is what stops a future rename silently disabling the watcher (issue #54). The minimal `run.sh` above does not, so if you hand-write it, keep the `MA=` line correct yourself.
 
 > **Note:** The `python3.13` in `DST=` tracks MA's Python version, which changes over time (recent Music Assistant builds use `python3.14`). The installer auto-detects it; if you edit `run.sh` by hand, set it to match.
-> Check with: `docker exec addon_d5369777_music_assistant ls /app/venv/lib/`
+> Check with: `docker exec "$MA" ls /app/venv/lib/`
 
 > **Note:** The `run.sh` above is the minimal core (re-inject after container recreation). The `run.sh` that the installer generates additionally implements [Auto-update](#auto-update): it reads `auto_update`/`update_interval_hours` from `/data/options.json`, fetches the latest provider tarball into a `/data` cache, and reinstalls only when the SHA-256 changes.
 
@@ -198,7 +201,7 @@ Run `sh install_watcher_addon.sh --help` to see all options.
 >
 > `curl ... | sh --force` parses `--force` as a shell option and fails with `sh: bad option '--force'`.
 
-> **Auto-detection caveats:** the MA container ID and Python version are detected via `docker ps` / `docker exec`, which requires running the script from a host shell with Docker access (e.g. the SSH & Web Terminal add-on with Protection Mode off, or the host shell on a Supervised install). If detection fails, the script falls back to `addon_d5369777_music_assistant` and `python3.13` and prints a warning, so verify and re-run with `--ma-id` / `--python-version` if those defaults are wrong for your install.
+> **Auto-detection caveats:** the MA container ID and Python version are detected via `docker ps` / `docker exec`, which requires running the script from a host shell with Docker access (e.g. the SSH & Web Terminal add-on with Protection Mode off, or the host shell on a Supervised install). If detection fails, the script falls back to `app_d5369777_music_assistant` and `python3.13` and prints a warning, so verify and re-run with `--ma-id` / `--python-version` if those defaults are wrong for your install. A wrong container name is now recoverable on its own: the generated `run.sh` re-detects at startup and whenever the configured name goes missing, and logs that it has adapted. A wrong Python version is not, so that one is worth checking.
 
 ---
 

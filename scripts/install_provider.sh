@@ -112,24 +112,50 @@ need_docker
 
 # --- Detect MA container -----------------------------------------------------
 
+# Supervisor renamed add-on containers from "addon_*" to "app_*", the same
+# rename that moved local add-ons from addons/local to apps/local (issue #22).
+# Both spellings are in the field depending on Supervisor version, so match
+# either. Still anchored at both ends with an explicit channel-suffix list, so
+# the watcher's own container ("..._ma_provider_watcher") cannot match and have
+# the installer target itself. Issue #54.
+MA_NAME_RE='^(addon|app)_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$'
+
 if [ -z "$MA_ID" ]; then
     MA_ID="$(docker ps --format '{{.Names}}' 2>/dev/null \
-             | grep -E '^addon_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' \
+             | grep -E "$MA_NAME_RE" \
              | head -n1 || true)"
-    if [ -z "$MA_ID" ]; then
-        MA_ID="addon_d5369777_music_assistant"
-        log "WARN: could not auto-detect MA container; using fallback '$MA_ID'."
-        log "      Verify with: docker ps | grep music"
-        log "      then re-run with the right id, e.g.:"
-        log "        curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
-    else
+    if [ -n "$MA_ID" ]; then
         log "Detected MA container: $MA_ID"
+    else
+        # Auto-detect found nothing, usually because MA is stopped: docker ps
+        # lists only running containers. Probe the well-known name in both
+        # spellings rather than guessing one, so the fallback either names a
+        # container that really is there or reports that it found none.
+        for _cand in app_d5369777_music_assistant addon_d5369777_music_assistant; do
+            if docker inspect "$_cand" >/dev/null 2>&1; then
+                MA_ID="$_cand"
+                log "No running MA container matched; using existing '$MA_ID'."
+                break
+            fi
+        done
     fi
 fi
 
-# Confirm the MA container actually exists before we go further.
+if [ -z "$MA_ID" ]; then
+    die "could not find the Music Assistant container (looked for names matching
+  $MA_NAME_RE
+and probed app_d5369777_music_assistant / addon_d5369777_music_assistant).
+List what is actually there with: docker ps -a | grep music
+then re-run with the right id, e.g.:
+  curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
+fi
+
+# Confirm the container exists before we go further. Reachable for an explicit
+# --ma-id, and for a detected one if it disappeared in between.
 docker inspect "$MA_ID" >/dev/null 2>&1 \
-    || die "MA container '$MA_ID' not found. Re-run with the right name, e.g.:
+    || die "MA container '$MA_ID' not found. List what is there with:
+  docker ps -a | grep music
+then re-run with the right name, e.g.:
   curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
 
 # --- Detect Python version ---------------------------------------------------
@@ -151,15 +177,34 @@ DST_DIR="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
 # --- Detect /config directory (for staging) ---------------------------------
 
 if [ "$NO_STAGE" -ne 1 ] && [ -z "$CONFIG_DIR" ]; then
-    if [ -d /mnt/data/supervisor/homeassistant ]; then
-        CONFIG_DIR="/mnt/data/supervisor/homeassistant"
-        log "Detected HAOS config path: $CONFIG_DIR"
-    elif [ -d /usr/share/hassio/homeassistant ]; then
-        CONFIG_DIR="/usr/share/hassio/homeassistant"
-        log "Detected Supervised config path: $CONFIG_DIR"
-    else
-        log "WARN: could not detect /config path; skipping staging step."
-        log "      Pass --config-dir DIR to enable staging."
+    # Two candidates was too few: the reporter in issue #54 got "could not
+    # detect /config path" on a current HAOS and the install silently went
+    # unstaged, which means the next MA add-on update wipes the provider. Probe
+    # the same breadth install_watcher_addon.sh uses for the add-ons directory,
+    # including /config itself, which is what this looks like from inside the
+    # SSH or Terminal add-on.
+    for _cand in \
+        /config \
+        /homeassistant \
+        /mnt/data/supervisor/homeassistant \
+        /usr/share/hassio/homeassistant \
+        /var/lib/homeassistant/homeassistant \
+        /data/homeassistant
+    do
+        [ -d "$_cand" ] || continue
+        CONFIG_DIR="$_cand"
+        log "Detected config path: $CONFIG_DIR"
+        break
+    done
+    if [ -z "$CONFIG_DIR" ]; then
+        log "WARN: could not detect the /config path; skipping the staging step."
+        log "      The provider is installed, but staging is what lets it survive"
+        log "      a Music Assistant add-on update, so without it the next MA"
+        log "      update removes it again."
+        log "      Probed: /config /homeassistant /mnt/data/supervisor/homeassistant"
+        log "              /usr/share/hassio/homeassistant"
+        log "              /var/lib/homeassistant/homeassistant /data/homeassistant"
+        log "      Re-run with --config-dir DIR to enable staging."
         NO_STAGE=1
     fi
 fi

@@ -85,7 +85,7 @@ printf '\n== MA container auto-detect regex ==\n'
 # the stable "..._music_assistant" name (issue #35). Extract the exact pattern
 # the script uses so this test tracks the real code, then exercise it (this also
 # proves the ERE is portable to the dash/BusyBox grep the CI runs under).
-MA_PAT="$(sed -n "s/.*grep -E '\(\^addon_[^']*\)'.*/\1/p" "$SCRIPT" | head -n1)"
+MA_PAT="$(sed -n "s/^MA_NAME_RE='\(.*\)'$/\1/p" "$SCRIPT" | head -n1)"
 
 if [ -n "$MA_PAT" ]; then
     pass "extracted MA-detect regex from script"
@@ -93,16 +93,26 @@ if [ -n "$MA_PAT" ]; then
     for _name in addon_d5369777_music_assistant \
                  addon_d5369777_music_assistant_beta \
                  addon_ff_music_assistant_nightly \
-                 addon_ff_music_assistant_dev; do
+                 addon_ff_music_assistant_dev \
+                 app_d5369777_music_assistant \
+                 app_d5369777_music_assistant_beta \
+                 app_ff_music_assistant_nightly \
+                 app_ff_music_assistant_dev; do
         if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
             pass "MA-detect regex matches $_name"
         else
             fail "MA-detect regex matches $_name" "expected a match"
         fi
     done
+    # The watcher's own container must never match, or it targets itself.
     for _name in addon_ff_ma_provider_watcher \
+                 app_ff_ma_provider_watcher \
                  addon_ff_music_assistant_watcher \
+                 app_ff_music_assistant_watcher \
                  addon_ff_some_music_assistant_x \
+                 app_ff_some_music_assistant_x \
+                 apps_ff_music_assistant \
+                 myapp_ff_music_assistant \
                  music_assistant; do
         if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
             fail "MA-detect regex rejects $_name" "unexpected match"
@@ -238,6 +248,22 @@ if [ "$network_ok" = "1" ]; then
     assert_contains "run.sh shebang is bash" "#!/usr/bin/env bash" "$runsh"
     assert_contains "run.sh logs the watched container name on start" "Watching for container name" "$runsh"
     assert_contains "run.sh has misconfig diagnostic function" "warn_if_ma_misconfigured" "$runsh"
+
+    # Issue #54: the watcher addresses MA by a name baked in at install time,
+    # and Supervisor renamed those containers underneath every existing
+    # install. Nothing errored, because the name was correct when written, so
+    # affected watchers silently stopped updating anyone. run.sh must be able
+    # to recover on its own, or the next rename does the same thing again.
+    assert_contains "run.sh re-resolves the container at runtime" "resolve_ma()" "$runsh"
+    assert_contains "run.sh carries the detect regex for re-resolution" \
+        "MA_NAME_RE='^(addon|app)_" "$runsh"
+    assert_contains "run.sh re-resolves before the first inject" "resolve_ma || true" "$runsh"
+    # The generated regex must be single-quoted in run.sh, or the trailing "$"
+    # anchor would be eaten as a shell variable when run.sh is sourced.
+    case "$runsh" in
+        *"_dev)?\$'"*) pass "run.sh regex keeps its end anchor quoted" ;;
+        *) fail "run.sh regex keeps its end anchor quoted" "anchor missing or unquoted" ;;
+    esac
     assert_contains "run.sh references MISSING_GRACE_SECONDS" "MISSING_GRACE_SECONDS" "$runsh"
     assert_contains "run.sh diagnostic mentions --ma-id remedy" "--ma-id" "$runsh"
 
@@ -297,8 +323,12 @@ if [ "$network_ok" = "1" ]; then
     if printf '%s' "$fallback_out" | grep -q 'could not auto-detect MA container'; then
         pass "warns when MA container is not detected"
         runsh3="$(cat "$ADDON/run.sh" 2>/dev/null || echo '')"
+        # "app_" not "addon_": Supervisor renamed add-on containers, and the
+        # fallback has to guess the spelling current installs actually use
+        # (issue #54). Guessing wrong is now survivable either way, because
+        # run.sh re-detects at runtime, but the guess should still be right.
         assert_contains "fallback MA ID baked into run.sh" \
-            'MA="addon_d5369777_music_assistant"' "$runsh3"
+            'MA="app_d5369777_music_assistant"' "$runsh3"
     else
         skip "test environment auto-detected an MA container -- warning path not exercised"
     fi

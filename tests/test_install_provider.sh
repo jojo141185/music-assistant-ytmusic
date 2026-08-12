@@ -86,7 +86,7 @@ printf '\n== MA container auto-detect regex ==\n'
 # the stable "..._music_assistant" name (issue #35). Extract the exact pattern
 # the script uses so this test tracks the real code, then exercise it (this also
 # proves the ERE is portable to the dash/BusyBox grep the CI runs under).
-MA_PAT="$(sed -n "s/.*grep -E '\(\^addon_[^']*\)'.*/\1/p" "$SCRIPT" | head -n1)"
+MA_PAT="$(sed -n "s/^MA_NAME_RE='\(.*\)'$/\1/p" "$SCRIPT" | head -n1)"
 
 if [ -n "$MA_PAT" ]; then
     pass "extracted MA-detect regex from script"
@@ -94,16 +94,27 @@ if [ -n "$MA_PAT" ]; then
     for _name in addon_d5369777_music_assistant \
                  addon_d5369777_music_assistant_beta \
                  addon_ff_music_assistant_nightly \
-                 addon_ff_music_assistant_dev; do
+                 addon_ff_music_assistant_dev \
+                 app_d5369777_music_assistant \
+                 app_d5369777_music_assistant_beta \
+                 app_ff_music_assistant_nightly \
+                 app_ff_music_assistant_dev; do
         if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
             pass "MA-detect regex matches $_name"
         else
             fail "MA-detect regex matches $_name" "expected a match"
         fi
     done
+    # The watcher's own container must never match, or the installer targets
+    # itself. Both spellings, since both are now accepted on the left.
     for _name in addon_ff_ma_provider_watcher \
+                 app_ff_ma_provider_watcher \
                  addon_ff_music_assistant_watcher \
+                 app_ff_music_assistant_watcher \
                  addon_ff_some_music_assistant_x \
+                 app_ff_some_music_assistant_x \
+                 apps_ff_music_assistant \
+                 myapp_ff_music_assistant \
                  music_assistant; do
         if printf '%s\n' "$_name" | grep -qE "$MA_PAT"; then
             fail "MA-detect regex rejects $_name" "unexpected match"
