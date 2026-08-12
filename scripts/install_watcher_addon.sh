@@ -139,17 +139,35 @@ ADDON_DIR="$ADDONS_DIR/$ADDON_SLUG"
 
 # --- Detect MA container & Python version (best effort) ---------------------
 
+# Kept byte-identical to install_provider.sh on purpose: both scripts target
+# the same container, and the two copies drifting is what made issue #22's
+# addons/local -> apps/local rename get fixed in one script and missed in the
+# other. See the comment there for why both prefixes are matched. Issue #54.
+MA_NAME_RE='^(addon|app)_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$'
+
 if [ -z "$MA_ID" ]; then
     if command -v docker >/dev/null 2>&1; then
         MA_ID="$(docker ps --format '{{.Names}}' 2>/dev/null \
-                 | grep -E '^addon_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' \
+                 | grep -E "$MA_NAME_RE" \
                  | head -n1 || true)"
+        if [ -z "$MA_ID" ]; then
+            for _cand in app_d5369777_music_assistant addon_d5369777_music_assistant; do
+                if docker inspect "$_cand" >/dev/null 2>&1; then
+                    MA_ID="$_cand"
+                    log "No running MA container matched; using existing '$MA_ID'."
+                    break
+                fi
+            done
+        fi
     fi
     if [ -z "$MA_ID" ]; then
-        MA_ID="addon_d5369777_music_assistant"
-        log "WARN: could not auto-detect MA container; using fallback '$MA_ID'."
-        log "      Verify with: docker ps | grep music"
-        log "      then re-run with the right id, e.g.:"
+        # Unlike install_provider.sh this cannot be fatal: the watcher is often
+        # installed from a shell with no Docker access at all, and the generated
+        # run.sh re-detects at runtime anyway, where it does have the socket.
+        MA_ID="app_d5369777_music_assistant"
+        log "WARN: could not auto-detect MA container; baking in '$MA_ID'."
+        log "      The watcher re-detects at runtime if that name is not there,"
+        log "      so this is usually harmless. To pin it explicitly:"
         log "        curl -fsSL $SCRIPT_URL | sh -s -- --ma-id <ID>"
     else
         log "Detected MA container: $MA_ID"
@@ -383,6 +401,35 @@ echo "[\$(date)] Docker OK"
 
 log() { echo "[\$(date)] \$*"; }
 
+# Re-resolve the container name at runtime rather than trusting what the
+# installer baked in. Supervisor renamed add-on containers from "addon_*" to
+# "app_*" (issue #54), and every watcher installed before that kept the old name
+# in this file and silently stopped updating anyone: there is no install-time
+# error to notice, because the name was correct when it was written.
+#
+# Anything auto-updating a container it addresses by a fixed name has to be able
+# to recover when the platform renames it, so this now re-detects whenever the
+# configured name is absent, and only falls back to complaining when nothing at
+# all matches.
+MA_NAME_RE='$MA_NAME_RE'
+
+resolve_ma() {
+    if docker inspect "\$MA" >/dev/null 2>&1; then
+        return 0
+    fi
+    _found="\$(docker ps --format '{{.Names}}' 2>/dev/null \\
+               | grep -E "\$MA_NAME_RE" | head -n1 || true)"
+    if [ -n "\$_found" ] && [ "\$_found" != "\$MA" ]; then
+        log "Configured container '\$MA' is not present; using '\$_found' instead."
+        log "HINT: this usually means the add-on container was renamed. The"
+        log "      watcher has adapted, but re-running the installer will make"
+        log "      the change permanent."
+        MA="\$_found"
+        return 0
+    fi
+    return 1
+}
+
 # provider_src() and fetch_latest() come from /watcher_lib.sh (sourced above).
 
 install_provider() {
@@ -422,6 +469,11 @@ else
 fi
 log "provider source: \$(provider_src)"
 
+# Adapt to a renamed container before the first inject, so a watcher installed
+# under the old "addon_*" naming starts working again on its next restart
+# instead of silently doing nothing.
+resolve_ma || true
+
 LAST_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
 if [ -n "\$LAST_ID" ]; then
     echo "[\$(date)] MA running (\${LAST_ID:0:12}), installing provider..."
@@ -450,8 +502,15 @@ while true; do
         MISSING_SINCE=\$(date +%s)
     elif [ -z "\$CUR_ID" ] && [ "\$MISSING_WARNED" -eq 0 ] && [ "\$MISSING_SINCE" -gt 0 ]; then
         if [ \$((\$(date +%s) - MISSING_SINCE)) -ge "\$MISSING_GRACE_SECONDS" ]; then
-            warn_if_ma_misconfigured
-            MISSING_WARNED=1
+            # A container that has gone missing and stayed missing is exactly
+            # the symptom of a rename, so try to re-resolve before concluding
+            # the user has misconfigured something.
+            if resolve_ma; then
+                MISSING_SINCE=\$(date +%s)
+            else
+                warn_if_ma_misconfigured
+                MISSING_WARNED=1
+            fi
         fi
     fi
     # Periodic auto-update: fetch latest; reinject + restart MA only on change.

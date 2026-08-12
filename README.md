@@ -83,23 +83,29 @@ Then jump to step 4 below to add the provider in the MA UI, and see [WATCHER_ADD
 
 ### 1. Find your MA container name
 
-In an HAOS / Supervised setup the container is typically named:
-```
-addon_d5369777_music_assistant
-```
-Confirm it with:
+In an HAOS / Supervised setup the container is named `app_d5369777_music_assistant` on current Supervisor versions, and `addon_d5369777_music_assistant` on older ones. Supervisor renamed the prefix, so which one you have depends on your version. Find yours:
+
 ```bash
-docker ps | grep music
+docker ps --format '{{.Names}}' | grep music_assistant
 ```
+
+The commands below use a `$MA` variable so you can paste them unchanged whichever prefix you have:
+
+```bash
+MA=$(docker ps --format '{{.Names}}' | grep -E '^(addon|app)_[0-9a-f]+_music_assistant(_beta|_nightly|_dev)?$' | head -n1)
+echo "$MA"
+```
+
+If that prints nothing, Music Assistant is not running; start it and try again.
 
 ### 2. Copy the provider into the container
 
 The provider lives in MA's Python `site-packages`, and the Python version moves over time (recent Music Assistant builds use `python3.14`, older ones `python3.13`). Detect it instead of hard-coding the path:
 
 ```bash
-PYVER=$(docker exec addon_d5369777_music_assistant sh -c 'ls /app/venv/lib' | grep -m1 '^python3')
+PYVER=$(docker exec "$MA" sh -c 'ls /app/venv/lib' | grep -m1 '^python3')
 docker cp /path/to/ytmusic_free \
-  "addon_d5369777_music_assistant:/app/venv/lib/$PYVER/site-packages/music_assistant/providers/"
+  "$MA:/app/venv/lib/$PYVER/site-packages/music_assistant/providers/"
 ```
 
 Replace `/path/to/ytmusic_free` with wherever you placed the folder (e.g. `/config/custom_components/mass/providers/ytmusic_free`). The one-line `install_provider.sh` runs this detection for you, so prefer it unless you are debugging.
@@ -107,7 +113,7 @@ Replace `/path/to/ytmusic_free` with wherever you placed the folder (e.g. `/conf
 ### 3. Restart Music Assistant
 
 ```bash
-docker restart addon_d5369777_music_assistant
+docker restart "$MA"
 ```
 
 > **Important:** Restarting MA from the Home Assistant UI recreates the container from its image, wiping any files you copied in. Always use `docker restart` to preserve the provider files.
@@ -317,8 +323,13 @@ playlist links.)
 - The usual cause is capturing both cookies from one browser that has several Google accounts signed in. Google sends the **same** cookie for every account in that session, and only the `X-Goog-AuthUser` index says which account a request means, so recapturing the cookie "for the other account" changes nothing. Either capture each cookie in a separate incognito window signed in to one account only, or set the **Account index** field on the second instance to that account's `X-Goog-AuthUser` value (visible on any `youtubei/v1/...` request in DevTools).
 - If both entries point at the same personal account on purpose, set the **Brand account ID** on one of them to split them apart.
 
+**Install script fails with "MA container not found"**
+- Supervisor renamed add-on containers from `addon_*` to `app_*`. Current versions of the installer detect both, so update the script first by re-running the one-line install. If you are on an older copy, pass the name explicitly: `--ma-id app_d5369777_music_assistant`.
+- Find the real name with `docker ps --format '{{.Names}}' | grep music_assistant`.
+- If you installed the watcher add-on before this fix, it baked the old `addon_*` name into its `run.sh` and has been silently doing nothing since the rename: no error, because the name was right when it was written. Current versions re-detect at runtime and log that they have adapted, so re-running the watcher installer once is enough. Background: [#54](https://github.com/sproft/music-assistant-ytmusic/issues/54).
+
 **Files disappear after restarting Home Assistant**
-- Only use `docker restart addon_d5369777_music_assistant` to restart MA.
+- Only use `docker restart "$MA"` to restart MA (see "Find your MA container name" above).
 - Restarting HA from the UI recreates the container from scratch. See [WATCHER_ADDON.md](WATCHER_ADDON.md) to set up automatic re-copying.
 
 ---
