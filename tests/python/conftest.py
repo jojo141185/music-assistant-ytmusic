@@ -198,6 +198,11 @@ def _install_music_assistant_models() -> None:
         item_id: str
         provider: str
         name: str = ""
+        # Upstream carries this and the provider now fills it for albums
+        # reached through a track (issue #53). Without it here the stub would be
+        # missing a field reality has, and a test could not tell a year that was
+        # set from one that silently went nowhere.
+        year: int | None = None
 
         def __hash__(self):
             return hash((self.media_type, self.item_id, self.provider))
