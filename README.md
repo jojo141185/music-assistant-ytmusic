@@ -314,6 +314,12 @@ playlist links.)
 - The cookie must contain `__Secure-3PAPISID`, `SID`, `HSID`, and `SSID`.
 - If you use a brand account, enter the brand account ID (21-digit number from [myaccount.google.com/brandaccounts](https://myaccount.google.com/brandaccounts)).
 
+**My library keeps emptying, and re-applying the cookie fixes it**
+- Fixed in current versions. YouTube does not answer a lapsed session with an auth error: it answers HTTP 200 with a logged-out payload, which reads as an empty library. Music Assistant treats a completed sync as authoritative, so anything it held that the provider did not return this round is dropped from the library and unfavourited. An expired cookie therefore did not just stop refreshing your library, it deleted it.
+- Two things made this silent. The provider announced "library sync enabled" after a validation call that a dead cookie passes, and its guard against empty syncs only armed once a category had been seen populated *in the current process*, so any restart disarmed it.
+- Now: the cookie is verified against the account at startup, an empty sync is checked against the live session every time rather than only sometimes, and a sync that cannot be authenticated fails loudly instead of reporting an empty library. A failed sync leaves your library untouched.
+- This does not extend how long a cookie lasts. That is Google's decision and nothing here can change it. It does mean an expired cookie costs you a warning in the log rather than your favourites. Background: [#55](https://github.com/sproft/music-assistant-ytmusic/issues/55).
+
 **Library is empty after auth**
 - Your YouTube Music library only shows content you've explicitly liked, saved, or subscribed to.
 - If your library is on a brand account, make sure the brand account ID is set.

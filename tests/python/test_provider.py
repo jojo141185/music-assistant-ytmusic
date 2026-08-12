@@ -378,6 +378,73 @@ def _setup_instance(monkeypatch, instance_id, values):
     return instance
 
 
+def _setup_cookie_instance(monkeypatch, instance_id, *, library, account_info):
+    """Run handle_async_init with cookie auth and a scripted ytmusicapi client."""
+    instance = _make_provider(instance_id)
+    instance.config = _StubConfig(
+        {
+            ytm.CONF_AUTH_TYPE: ytm.AUTH_TYPE_COOKIE,
+            ytm.CONF_COOKIE: "__Secure-3PAPISID=abc; SID=def",
+        }
+    )
+    _forbid_open(monkeypatch)
+
+    async def _noop():
+        return None
+
+    client = MagicMock()
+    client.get_library_songs = MagicMock(return_value=library)
+    client.get_account_info = MagicMock(return_value=account_info)
+
+    monkeypatch.setattr(instance, "_install_packages", _noop)
+    monkeypatch.setattr(instance, "_purge_legacy_auth_file", _noop)
+    monkeypatch.setattr(instance, "_create_ytmusic_client", lambda auth=None, user=None: client)
+    monkeypatch.setattr(instance, "_build_auth_headers", lambda cookie, user: {"Cookie": cookie})
+    handler = _attach_capture(instance)
+    asyncio.run(instance.handle_async_init())
+    return instance, handler
+
+
+def test_init_does_not_claim_success_on_a_lapsed_cookie(monkeypatch):
+    """Issue #55: "library sync enabled" was printed over a dead cookie.
+
+    A lapsed YouTube session answers HTTP 200 with a logged-out payload rather
+    than 401, so the validation call succeeded and the provider announced that
+    library sync was enabled. The reporter flagged that line as the odd part of
+    their evidence, and they were right: it was the bug.
+    """
+    instance, handler = _setup_cookie_instance(
+        monkeypatch, "inst_lapsed", library=[], account_info={}
+    )
+
+    assert instance._authenticated is False
+    joined = " ".join(handler.messages()).lower()
+    assert "library sync enabled" not in joined
+    assert "anonymous" in joined
+
+
+def test_init_still_authenticates_an_account_with_an_empty_library(monkeypatch):
+    """An empty library is not evidence of a bad cookie when the session is live."""
+    instance, _ = _setup_cookie_instance(
+        monkeypatch, "inst_empty_but_valid", library=[], account_info={"accountName": "Real"}
+    )
+
+    assert instance._authenticated is True
+
+
+def test_init_skips_the_probe_when_the_library_call_returns_items(monkeypatch):
+    """The common path must not pay for an extra request."""
+    instance, _ = _setup_cookie_instance(
+        monkeypatch,
+        "inst_populated",
+        library=[{"videoId": "v1", "title": "x"}],
+        account_info={"accountName": "Real"},
+    )
+
+    assert instance._authenticated is True
+    assert instance._ytmusic.get_account_info.call_count == 0
+
+
 def test_prefer_quality_false_is_honored(monkeypatch):
     """A configured False must survive; `or True` used to swallow it."""
     instance = _setup_instance(
@@ -2897,6 +2964,40 @@ def test_is_auth_lapse_ignores_non_auth_errors(provider):
     assert provider._is_auth_lapse(RuntimeError("HTTP 403: Forbidden")) is False
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Video ids and track titles pass through these messages routinely, and
+        # "401" as a bare substring matched any of them. Telling someone their
+        # cookie expired because a video id contained three digits sends them
+        # to re-capture a cookie that was fine.
+        "No formats found for abc401xyz",
+        "get_song failed for 4012abcdefg",
+        "Timeout after 401 seconds",
+        "HTTP 500 while fetching 401k Podcast",
+        "Playlist 'Top 401 of 2026' is unviewable",
+    ],
+)
+def test_is_auth_lapse_does_not_fire_on_an_incidental_401(provider, message):
+    assert provider._is_auth_lapse(RuntimeError(message)) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Server returned HTTP 401: Unauthorized",
+        "401 Client Error: Unauthorized for url: https://music.youtube.com/...",
+        "status_code=401",
+        "status code: 401",
+        "Unauthorized",
+        "Please provide authentication before using this function",
+        "authentication failed",
+    ],
+)
+def test_is_auth_lapse_still_recognises_real_auth_errors(provider, message):
+    assert provider._is_auth_lapse(RuntimeError(message)) is True
+
+
 def test_library_error_warning_includes_refresh_hint_on_auth_lapse(provider):
     handler = _attach_capture(provider)
     provider._auth_lapse_warned = False
@@ -3047,29 +3148,52 @@ def _track_dict(video_id: str, title: str = "x") -> dict:
     }
 
 
-def test_first_empty_library_sync_does_not_warn_or_raise(provider):
-    """A brand-new account with no liked songs should sync to empty silently."""
+def test_first_empty_library_sync_is_verified_then_accepted(provider):
+    """A brand-new account with no liked songs still syncs to empty silently.
+
+    It is now *verified* empty rather than assumed empty. The guard used to
+    skip the probe unless the category had been seen populated earlier in this
+    process, and that state resets on every init, so after a restart a lapsed
+    cookie was indistinguishable from a new account and Music Assistant deleted
+    the library to match. Issue #55.
+    """
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
     mock = MagicMock()
     mock.get_library_songs = MagicMock(return_value=[])
-    mock.get_account_info = MagicMock(
-        return_value={"accountName": "Should Not Be Called"}
-    )
+    mock.get_account_info = MagicMock(return_value={"accountName": "Real User"})
     provider._ytmusic = mock
 
     result = _consume(provider.get_library_tracks())
 
     assert result == []
-    # Probe must not be invoked on first-ever empty result.
-    assert mock.get_account_info.call_count == 0
+    assert mock.get_account_info.call_count == 1, (
+        "an empty library must be verified against the session, not assumed"
+    )
     warnings = [r for r in handler.records if r.levelname == "WARNING"]
     assert warnings == []
 
 
-def test_repeated_empty_library_sync_does_not_warn_or_probe(provider):
-    """Empty → empty (never populated) must stay silent and never probe."""
+def test_empty_library_sync_raises_on_the_very_first_sync_after_a_lapse(provider):
+    """The exact issue #55 shape: restart, then a first sync that is empty.
+
+    No prior populated state exists in memory, so this is the case the old
+    guard let through.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(return_value=[])
+    mock.get_account_info = MagicMock(return_value={})  # logged-out shape
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="cookie lapse"):
+        _consume(provider.get_library_tracks())
+
+
+def test_repeated_empty_library_sync_stays_silent_while_the_session_is_alive(provider):
+    """Empty → empty on a live session must stay silent."""
     provider._authenticated = True
     handler = _attach_capture(provider)
     mock = MagicMock()
@@ -3080,7 +3204,9 @@ def test_repeated_empty_library_sync_does_not_warn_or_probe(provider):
     _consume(provider.get_library_tracks())
     _consume(provider.get_library_tracks())
 
-    assert mock.get_account_info.call_count == 0
+    # Probed each time. One request per empty sync is a trivial cost next to
+    # the alternative, which is deleting someone's library on a bad guess.
+    assert mock.get_account_info.call_count == 2
     assert [r for r in handler.records if r.levelname == "WARNING"] == []
 
 
@@ -3098,7 +3224,7 @@ def test_populated_then_empty_triggers_probe_and_raises_on_lapse(provider):
     first = _consume(provider.get_library_tracks())
     assert len(first) == 1
 
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_tracks())
 
     assert mock.get_account_info.call_count == 1
@@ -3125,7 +3251,11 @@ def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
 
 
 def test_populated_then_empty_does_not_raise_on_undetermined_probe(provider):
-    """Transient probe error must not raise — that would invent a false alarm."""
+    """Transient probe error must not raise — that would invent a false alarm.
+
+    It does warn, though. This is the one remaining path that can still let a
+    library be deleted, so it should not pass in silence.
+    """
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -3137,7 +3267,10 @@ def test_populated_then_empty_does_not_raise_on_undetermined_probe(provider):
     _consume(provider.get_library_tracks())
     result = _consume(provider.get_library_tracks())
     assert result == []
-    assert [r for r in handler.records if r.levelname == "WARNING"] == []
+    warnings = " ".join(
+        r.getMessage() for r in handler.records if r.levelname == "WARNING"
+    ).lower()
+    assert "inconclusive" in warnings
 
 
 def test_partial_auth_guard_covers_get_library_albums(provider):
@@ -3152,7 +3285,7 @@ def test_partial_auth_guard_covers_get_library_albums(provider):
     provider._ytmusic = mock
 
     _consume(provider.get_library_albums())
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_albums())
     joined = " ".join(handler.messages()).lower()
     assert "cookie" in joined
@@ -3169,7 +3302,7 @@ def test_partial_auth_guard_covers_get_library_playlists(provider):
     provider._ytmusic = mock
 
     _consume(provider.get_library_playlists())
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_playlists())
 
 
@@ -3187,7 +3320,7 @@ def test_partial_auth_guard_covers_get_library_artists(provider):
 
     first = _consume(provider.get_library_artists())
     assert len(first) == 1
-    with pytest.raises(RuntimeError, match="partial-auth"):
+    with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_artists())
 
 
@@ -3212,21 +3345,94 @@ def test_get_library_artists_parses_browse_id_and_artist_keys(provider):
     }
 
 
-def test_partial_auth_guard_per_category_state_isolated(provider):
-    """Having seen tracks must not arm the guard for playlists."""
-    provider._authenticated = True
+def _cookie_configured(provider, auth_type=None):
+    """Point provider.config at a cookie-auth configuration."""
+    from ytmusic_free import AUTH_TYPE_COOKIE
+
+    cfg = MagicMock()
+    cfg.get_value = lambda key, *a, **k: (
+        (auth_type or AUTH_TYPE_COOKIE) if key == ytm.CONF_AUTH_TYPE else None
+    )
+    provider.config = cfg
+
+
+@pytest.mark.parametrize(
+    ("method", "category"),
+    [
+        ("get_library_tracks", "tracks"),
+        ("get_library_albums", "albums"),
+        ("get_library_artists", "artists"),
+        ("get_library_playlists", "playlists"),
+    ],
+)
+def test_unauthenticated_library_sync_fails_instead_of_reporting_empty(
+    provider, method, category
+):
+    """Issue #55, the larger half: an unauthenticated sync must not report empty.
+
+    Music Assistant treats a completed sync as authoritative and deletes
+    anything it held that the provider did not return, unfavouriting whatever
+    is left unclaimed. The provider declares its library features
+    unconditionally at setup, so a failed cookie does not stop MA asking. The
+    old silent early return therefore answered "you have nothing", and MA
+    obediently emptied the library.
+    """
+    provider._authenticated = False
+    provider._auth_lapse_warned = False
+    _cookie_configured(provider)
+
+    with pytest.raises(RuntimeError, match="not active"):
+        _consume(getattr(provider, method)())
+
+
+def test_anonymous_instance_still_syncs_empty_without_raising(provider):
+    """A deliberately anonymous instance has no library and never had one.
+
+    Raising there would put a permanent error in the log of every anonymous
+    install, for a deletion that cannot happen.
+    """
+    provider._authenticated = False
+    _cookie_configured(provider, auth_type=ytm.AUTH_TYPE_NONE)
+
+    assert _consume(provider.get_library_tracks()) == []
+
+
+def test_unauthenticated_guard_warns_with_a_cookie_hint(provider):
+    provider._authenticated = False
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
+    _cookie_configured(provider)
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_tracks())
+
+    joined = " ".join(handler.messages()).lower()
+    assert "cookie" in joined
+
+
+def test_guard_checks_every_empty_category_regardless_of_history(provider):
+    """A category never seen populated is still checked when it comes back empty.
+
+    This inverts the old behaviour deliberately. Gating on per-category history
+    meant an account whose playlists happened to be empty on the sync before a
+    lapse would have its playlists deleted without a single check. The state it
+    gated on lived only in memory, so a restart put *every* category in that
+    position, which is issue #55.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
     mock = MagicMock()
     mock.get_library_songs = MagicMock(return_value=[_track_dict("v1")])
     mock.get_library_playlists = MagicMock(return_value=[])
-    mock.get_account_info = MagicMock(return_value={})  # would say lapsed if called
+    mock.get_account_info = MagicMock(return_value={})  # logged-out shape
     provider._ytmusic = mock
 
-    # Populate tracks state.
+    # Tracks came back populated, so no probe for that category.
     _consume(provider.get_library_tracks())
-    # Playlists has never been populated — empty result must not probe.
-    result = _consume(provider.get_library_playlists())
-    assert result == []
     assert mock.get_account_info.call_count == 0
-    assert [r for r in handler.records if r.levelname == "WARNING"] == []
+
+    # Playlists came back empty. Never populated in this process, and checked
+    # anyway.
+    with pytest.raises(RuntimeError, match="cookie lapse"):
+        _consume(provider.get_library_playlists())
+    assert mock.get_account_info.call_count == 1
