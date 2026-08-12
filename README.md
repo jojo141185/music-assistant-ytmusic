@@ -284,7 +284,20 @@ playlist links.)
 
 **Audio quality is low**
 - Enable "Prefer highest audio quality" in the provider settings (on by default).
-- The android_music client typically provides 128-256 kbps AAC or Opus in an M4A/WebM container.
+- With it enabled you normally get Opus in a WebM container at roughly 130 to 160 kbps. Disabling it restricts playback to AAC, usually around 128 kbps, for players that cannot handle Opus. Some accounts and regions are offered nothing better than a 48 kbps AAC stream.
+
+**Filtering out AI-generated music**
+- Turn on **Filter AI-generated music** in the provider settings, then give it something to work with. The toggle on its own filters nothing.
+- **Blocked artists** takes one entry per line, or several separated by semicolons. An entry is either an artist name or a YouTube channel id (`UC...`). Semicolons rather than commas on purpose: commas are common inside real artist names, and splitting on them would turn `Earth, Wind & Fire` into a rule that blocks everyone called Earth. Names match loosely, ignoring case and extra spacing; channel ids match exactly and are the better choice when two artists share a name. Lines starting with `#` are ignored.
+- **Blocklist URL** is optional and points at a list somebody else maintains, merged with your own entries. It accepts a JSON array of names or channel ids, a JSON object with an `artists` key, or plain text one entry per line. It refreshes in the background roughly twice a day, and if the URL is unreachable the previous list stays in effect rather than the filter quietly switching itself off.
+- **Scope:** this applies to auto-generated lists only, which is where unrequested music arrives: radio, mixes, similar tracks and the home feed. Search results, your library and playlists you picked yourself are never filtered, so looking up a blocked artist on purpose still finds them.
+- A track is dropped when any of its artists matches. Tracks whose artist could not be read are always kept, so a parsing gap never silently removes music.
+- Detection itself is out of scope here: the provider filters against a list, it does not judge whether a track is AI-generated. For a provider-agnostic approach that analyses the queue, see the discussion in [#53](https://github.com/sproft/music-assistant-ytmusic/issues/53).
+
+**Playback fails with 403 on some tracks**
+- Fixed in current versions. YouTube puts a pre-roll ad in front of some tracks, and the stream URL it returns is not valid until that ad window has passed. The provider now waits it out before handing the URL to Music Assistant. Before the fix these tracks resolved fine and then failed at playback, logging `Skipping unplayable item`.
+- This needs yt-dlp 2025.12.8 or newer, which the manifest now requires. `pip` will not upgrade a requirement that is already satisfied, so an installation that first resolved before that floor keeps its old yt-dlp. Check with `python -c "import yt_dlp; print(yt_dlp.version.__version__)"` inside the Music Assistant container and upgrade with `pip install --upgrade "yt-dlp[default]"` if it is older.
+- Releases between 2025.08.20 and 2025.11.12 report the ad window on every track whether or not there is an ad. The provider detects those and skips the wait, so it does not add a delay to every track. Background: [#51](https://github.com/sproft/music-assistant-ytmusic/issues/51).
 
 **Cookie authentication failed**
 - Make sure you copied the **entire** cookie string from the Network tab (2000+ characters).

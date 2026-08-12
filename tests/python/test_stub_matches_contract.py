@@ -25,6 +25,7 @@ from music_assistant_models.enums import ContentType
 # Imported from media_items, not streamdetails, because that is the path the
 # provider itself uses. Upstream re-exports the same class from both.
 from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.streamdetails import StreamDetails
 
 TESTS_ROOT = Path(__file__).resolve().parents[1]
 if str(TESTS_ROOT) not in sys.path:
@@ -82,3 +83,23 @@ def test_stub_audio_format_has_the_required_fields():
 
 def test_stub_bit_rate_defaults_to_none():
     assert AudioFormat().bit_rate is None
+
+
+def test_stub_stream_details_has_the_required_fields():
+    fields = {f.name for f in dataclasses.fields(StreamDetails)}
+    missing = set(ma_contract.REQUIRED_STREAM_DETAILS_FIELDS) - fields
+    assert not missing, f"stub StreamDetails is missing {missing}"
+
+
+def test_stub_stream_details_does_not_invent_a_delayed_availability_field():
+    """The stub must not offer an escape hatch upstream does not have.
+
+    ``get_stream_details`` blocks on a pre-roll ad window because there is no
+    field to hand the timestamp to (issue #51). A stub that invented one would
+    let a "cleaner" fix pass the unit suite and break in production.
+    """
+    fields = {f.name for f in dataclasses.fields(StreamDetails)}
+    present = sorted(fields.intersection(ma_contract.FORBIDDEN_STREAM_DETAILS_FIELDS))
+    assert not present, (
+        f"stub StreamDetails invented {present}, which upstream does not have"
+    )

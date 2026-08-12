@@ -15,11 +15,22 @@ users get without a single line of this repo changing.
 
 This drives the real ``_get_stream_format``, so it exercises the production
 ``ydl_opts`` and the production selector string rather than a copy of them.
+
+It also fetches bytes. Resolving a URL and playing it are separate failures:
+issue #51 was a URL that resolved perfectly every time and then answered the
+fetch with 403, because YouTube had put a pre-roll ad in front of the track.
+This suite passed green every morning of that outage, because none of it ever
+fetched anything. A canary that only checks extraction cannot see a playback
+bug, so ``test_live_stream_url_is_fetchable_the_moment_it_is_handed_over``
+fetches the first bytes of the URL the provider hands over, immediately, the
+same way Music Assistant does.
 """
 
 from __future__ import annotations
 
 import asyncio
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -37,6 +48,22 @@ KNOWN_VIDEO_IDS = ("dQw4w9WgXcQ", "kJQP7kiw5Fk", "9bZkp7q19f0")
 # region and account. Anything at or above this floor is unambiguously clear of
 # the bad stream, with room left for YouTube to shift its tiers.
 MIN_ACCEPTABLE_BITRATE = 96
+
+# Enough bytes to prove googlevideo served the media rather than an error page.
+PROBE_BYTES = 1024
+
+
+def _fetch_range(url: str) -> tuple[int, bytes]:
+    """Fetch the first bytes of ``url``. Returns (status, body).
+
+    Deliberately stdlib: the live suite installs nothing beyond what the offline
+    one needs, and a Range GET is not worth a dependency. Sends no headers other
+    than the range, because Music Assistant does not send any either, so a URL
+    that only works with yt-dlp's own headers should fail here rather than pass.
+    """
+    request = urllib.request.Request(url, headers={"Range": f"bytes=0-{PROBE_BYTES - 1}"})
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - https url from yt-dlp
+        return response.status, response.read(PROBE_BYTES)
 
 
 def _resolve_first_available(provider, *, prefer_quality=True):
@@ -104,6 +131,67 @@ def test_live_stream_details_report_a_usable_content_type(provider):
     )
     assert details.audio_format.bit_rate, f"{video_id}: no bitrate reached StreamDetails"
     assert details.path.startswith("http")
+
+
+def test_live_stream_url_is_fetchable_the_moment_it_is_handed_over(provider):
+    """Issue #51: a URL that resolves cleanly and then 403s on fetch.
+
+    Every other check in this file stops at "yt-dlp returned a url", which is
+    why this suite reported green every morning for eight days while playback
+    was broken for users. The failure only exists at fetch time, so the only
+    way to see it is to fetch.
+
+    YouTube puts a pre-roll ad in front of some tracks and serves a media URL
+    that is not valid until the ad window has passed. yt-dlp reports the window
+    as ``available_at`` and its own downloader sleeps it out before touching the
+    url; the provider has to do the same, because Music Assistant fetches the
+    moment it is handed one.
+
+    Fetching immediately is the entire point of this test. Any wait inserted
+    between ``get_stream_details`` returning and the fetch below would hide the
+    regression exactly the way yt-dlp's sleep hides it.
+    """
+    video_id, _ = _resolve_first_available(provider)
+
+    provider._yt_dlp_module = None
+    provider._prefer_quality = True
+    details = asyncio.run(provider.get_stream_details(video_id, MediaType.TRACK))
+
+    try:
+        status, body = _fetch_range(details.path)
+    except urllib.error.HTTPError as err:
+        pytest.fail(
+            f"{video_id}: the stream url resolved fine and then answered "
+            f"HTTP {err.code} when fetched. This is the issue #51 shape: "
+            "Music Assistant would log 'Skipping unplayable item' and the "
+            "user would hear nothing. If this is 403, check whether the "
+            "resolved format carried an 'available_at' in the future and the "
+            "provider failed to wait it out."
+        )
+    except urllib.error.URLError as err:
+        pytest.fail(f"{video_id}: could not reach the stream url at all: {err}")
+
+    assert status in (200, 206), f"{video_id}: unexpected status {status}"
+    assert len(body) > 0, (
+        f"{video_id}: googlevideo accepted the range request and returned no "
+        "bytes, which is not a stream anyone can play"
+    )
+
+
+def test_ytdlp_still_reports_the_preroll_window(provider):
+    """The provider's pre-roll wait is only as real as this field.
+
+    ``_preroll_wait_seconds`` reads ``available_at`` with ``.get``, so if
+    yt-dlp ever renames or drops it the wait silently becomes a no-op and
+    issue #51 comes back with no failing test anywhere. Nothing offline can
+    catch that: the unit tests feed the field in by hand.
+    """
+    video_id, fmt = _resolve_first_available(provider)
+    assert "available_at" in fmt, (
+        f"{video_id}: yt-dlp no longer reports 'available_at' on formats. The "
+        "provider's pre-roll wait now does nothing and tracks behind an ad "
+        "will 403 again (issue #51). Check what upstream replaced it with."
+    )
 
 
 def test_compatibility_mode_still_resolves_something_playable(provider):

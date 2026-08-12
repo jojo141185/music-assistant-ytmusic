@@ -70,3 +70,32 @@ REQUIRED_AUDIO_FORMAT_FIELDS: tuple[str, ...] = (
     "channels",
     "bit_rate",
 )
+
+# ``StreamDetails`` fields the provider sets, either as constructor arguments
+# or by assignment afterwards.
+REQUIRED_STREAM_DETAILS_FIELDS: tuple[str, ...] = (
+    "provider",
+    "item_id",
+    "audio_format",
+    "stream_type",
+    "path",
+    "can_seek",
+    "allow_seek",
+    "expiration",
+    "duration",
+    "extra_input_args",
+)
+
+# Names for "this url is not fetchable until T". Upstream has none of them, and
+# that absence is load-bearing: it is why the provider sits out YouTube's
+# pre-roll ad window itself, inside ``get_stream_details``, rather than passing
+# the timestamp along (issue #51). Blocking the provider call is the worse of
+# two options and only justified while there is nowhere to put the value. If
+# any of these appears upstream, ``_preroll_wait_seconds`` should feed it
+# instead of ``asyncio.sleep``.
+FORBIDDEN_STREAM_DETAILS_FIELDS: tuple[str, ...] = (
+    "available_at",
+    "available_from",
+    "not_before",
+    "start_after",
+)
