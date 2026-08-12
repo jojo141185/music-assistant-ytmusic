@@ -1581,15 +1581,22 @@ def test_preroll_wait_returns_the_remaining_window():
     assert ytm._preroll_wait_seconds({"available_at": 1005.0}, now=1000.0) == 5.0
 
 
-def test_preroll_wait_is_capped():
-    """A malformed timestamp must not stall the queue indefinitely."""
-    wait = ytm._preroll_wait_seconds({"available_at": 2**40}, now=1000.0)
-    assert wait == ytm.MAX_PREROLL_WAIT
+def test_preroll_wait_is_reported_uncapped():
+    """The caller needs the real figure to tell a long wait from an absurd one."""
+    wait = ytm._preroll_wait_seconds({"available_at": 1000.0 + 500}, now=1000.0)
+    assert wait == 500.0
+    assert wait > ytm.MAX_PREROLL_WAIT
 
 
-def test_preroll_wait_survives_an_unparseable_value():
-    """Never raise out of the stream path over a field we only advise on."""
-    assert ytm._preroll_wait_seconds({"available_at": "soon"}, now=1000.0) == 0.0
+@pytest.mark.parametrize("value", ["soon", 10**400, object(), [1], {"a": 1}])
+def test_preroll_wait_survives_an_unparseable_value(value):
+    """Never raise out of the stream path over a field we only advise on.
+
+    ``10**400`` is the interesting one: ``float()`` raises OverflowError on it,
+    which is an ArithmeticError rather than a ValueError and so needs catching
+    explicitly.
+    """
+    assert ytm._preroll_wait_seconds({"available_at": value}, now=1000.0) == 0.0
 
 
 def test_preroll_wait_takes_the_latest_of_a_merged_format():
@@ -1691,6 +1698,72 @@ def test_ytdlp_preroll_support_by_version(version, honours):
     assert ytm._ytdlp_honours_preroll(version) is honours
 
 
+def _yt_dlp_stub_reporting(version):
+    """A fake yt_dlp module that reports ``version`` and resolves one format."""
+    import types
+
+    import yt_dlp as real_yt_dlp
+
+    module = types.ModuleType("yt_dlp")
+    module.utils = real_yt_dlp.utils
+    if version is not None:
+        module.version = types.SimpleNamespace(__version__=version)
+
+    class _FakeYoutubeDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "formats": [
+                    {
+                        "url": "https://stream.example/x",
+                        "vcodec": "none",
+                        "acodec": "opus",
+                        "ext": "webm",
+                        "abr": 130,
+                        "format_id": "251",
+                    }
+                ]
+            }
+
+        def build_format_selector(self, spec):
+            return real_yt_dlp.YoutubeDL(
+                {"quiet": True, "no_warnings": True, "simulate": True}
+            ).build_format_selector(spec)
+
+    module.YoutubeDL = _FakeYoutubeDL
+    return module
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("2025.10.01", False), ("2026.07.04", True), (None, True)],
+)
+def test_get_stream_format_sets_the_preroll_gate_from_the_ytdlp_version(
+    provider, version, expected
+):
+    """Binds the wiring, not just the pure predicate.
+
+    ``_preroll_supported`` defaults to True, so deleting the assignment inside
+    ``_extract`` left every other test green while the gate silently stopped
+    working. Driving the real ``_get_stream_format`` is the only way to catch
+    that.
+    """
+    provider._yt_dlp_module = _yt_dlp_stub_reporting(version)
+    provider._preroll_supported = not expected  # must be actively overwritten
+
+    asyncio.run(provider._get_stream_format("dQw4w9WgXcQ"))
+
+    assert provider._preroll_supported is expected
+
+
 def test_installed_ytdlp_is_new_enough_for_the_preroll_fix():
     """The version this repo tests against must be one where the fix applies.
 
@@ -1731,30 +1804,92 @@ def test_preroll_wait_is_skipped_on_a_yt_dlp_that_gets_it_wrong(provider, monkey
 def test_get_stream_details_waits_before_reading_the_url(provider, monkeypatch):
     """Ordering matters: the wait has to be over before the URL is handed on.
 
-    Asserting it structurally, by recording what has happened at the moment the
-    sleep is entered. A wait that runs after the StreamDetails is built would
-    still pass a naive "did it sleep" check while fixing nothing.
+    Recording an ordered event log rather than a set of flags. Asserting only
+    that both happened would pass just as happily if the sleep ran *after* the
+    StreamDetails was built, which would fix nothing.
     """
-    seen = {}
+    events = []
 
     async def _fake_sleep(seconds):
-        seen["slept_before_return"] = True
+        events.append("slept")
 
     monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
 
     async def _fmt(video_id):
-        seen["resolved"] = True
+        events.append("resolved")
         return {
             "url": "https://stream.example/x",
             "ext": "m4a",
             "available_at": time.time() + 3,
         }
 
+    original_init = ytm.StreamDetails.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        events.append("built")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(ytm.StreamDetails, "__init__", _spy_init)
+
     provider._get_stream_format = _fmt
     sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
 
-    assert seen == {"resolved": True, "slept_before_return": True}
+    assert events == ["resolved", "slept", "built"], (
+        "the pre-roll wait has to complete before the StreamDetails carrying "
+        "the url is built, or Music Assistant gets a url that is not valid yet"
+    )
     assert sd.path == "https://stream.example/x"
+
+
+def test_get_stream_details_refuses_an_absurd_preroll_instead_of_stalling(
+    provider, monkeypatch
+):
+    """Past the cap, fail fast rather than sleep the cap and 403 anyway.
+
+    Sleeping the maximum and then handing over a url we already know is still
+    gated gives the user the silence *and* the failure.
+    """
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + ytm.MAX_PREROLL_WAIT + 60,
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept == []
+    assert sd.path == "https://stream.example/x"
+
+
+def test_get_stream_details_still_waits_right_up_to_the_cap(provider, monkeypatch):
+    """The boundary: a long-but-plausible pod is served, not refused."""
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(ytm.asyncio, "sleep", _fake_sleep)
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "available_at": time.time() + ytm.MAX_PREROLL_WAIT - 5,
+        }
+
+    provider._get_stream_format = _fmt
+    asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+
+    assert slept and slept[0] <= ytm.MAX_PREROLL_WAIT
 
 
 # ---------------------------------------------------------------------------
@@ -1825,10 +1960,31 @@ def _blocklist_track(artist_name="Some Artist", artist_id="UC0000000000000000000
 
 def test_parse_blocklist_reads_plain_text():
     ids, names = ytm._parse_blocklist(
-        "# a comment\nSloppy Bot\nUC000000000000000000000a\n\n  Spaced   Name  # trailing\n"
+        "# a comment\nSloppy Bot\nUC000000000000000000000a\n\n  Spaced   Name  \n"
     )
     assert ids == frozenset({"UC000000000000000000000a"})
     assert names == frozenset({"sloppy bot", "spaced name"})
+
+
+def test_parse_blocklist_only_treats_a_leading_hash_as_a_comment():
+    """The config field and README both promise "lines starting with #".
+
+    Splitting on any "#" truncated names that legitimately contain one, so
+    "Panic! At The # Disco" became a rule matching "panic! at the".
+    """
+    ids, names = ytm._parse_blocklist("# real comment\nPanic! At The # Disco\n")
+    assert names == frozenset({"panic! at the # disco"})
+    assert ids == frozenset()
+
+
+def test_parse_blocklist_rejects_an_html_body():
+    """Some hosts answer a missing file with a 200 and an error page.
+
+    Without this guard every line of that page became a blocked artist name.
+    """
+    assert ytm._parse_blocklist(
+        "<html>\n<body>\nNot Found\n</body>\n</html>"
+    ) == (frozenset(), frozenset())
 
 
 def test_parse_blocklist_reads_a_json_array():
@@ -1940,20 +2096,39 @@ def test_ai_filter_keeps_a_track_with_no_artists(provider):
     assert provider._drop_ai_tracks([track], "test") == [track]
 
 
-def test_load_ai_filter_config_splits_commas_and_newlines(provider):
+def _configure_filter(provider, blocklist="", url="", enabled=True):
     provider.config = MagicMock()
     provider.config.get_value = lambda key: {
-        ytm.CONF_FILTER_AI_MUSIC: True,
-        ytm.CONF_AI_BLOCKLIST: "Sloppy Bot, Other Bot\nUC000000000000000000000a",
-        ytm.CONF_AI_BLOCKLIST_URL: "  ",
+        ytm.CONF_FILTER_AI_MUSIC: enabled,
+        ytm.CONF_AI_BLOCKLIST: blocklist,
+        ytm.CONF_AI_BLOCKLIST_URL: url,
     }.get(key)
-
     provider._load_ai_filter_config()
+
+
+def test_load_ai_filter_config_splits_semicolons_and_newlines(provider):
+    _configure_filter(
+        provider,
+        blocklist="Sloppy Bot; Other Bot\nUC000000000000000000000a",
+        url="  ",
+    )
 
     assert provider._ai_filter_enabled is True
     assert provider._ai_blocked_names == frozenset({"sloppy bot", "other bot"})
     assert provider._ai_blocked_channel_ids == frozenset({"UC000000000000000000000a"})
     assert provider._ai_blocklist_url == ""
+
+
+def test_load_ai_filter_config_keeps_commas_inside_an_artist_name(provider):
+    """Splitting on commas turned one band into a rule blocking "Earth".
+
+    That is the dangerous direction for this feature: a filter that removes
+    more than the user asked for is deleting music they like.
+    """
+    _configure_filter(provider, blocklist="Earth, Wind & Fire")
+
+    assert provider._ai_blocked_names == frozenset({"earth, wind & fire"})
+    assert "earth" not in provider._ai_blocked_names
 
 
 def test_remote_blocklist_merges_over_local_entries(provider):
@@ -1993,6 +2168,87 @@ def test_remote_blocklist_refresh_clears_its_in_flight_flag_on_success(provider)
     asyncio.run(provider._refresh_remote_blocklist())
 
     assert provider._ai_blocklist_refreshing is False
+    # Proves the fetch actually ran. Without this the assertion above passes on
+    # any early return, including aiohttp being absent, because False is the
+    # attribute's default.
+    assert provider._ai_blocked_names == frozenset({"remote bot"})
+
+
+def test_remote_blocklist_refresh_does_not_reenter_while_one_is_in_flight(provider):
+    """Two stale reads arriving together must not fire two fetches."""
+    provider._ai_blocklist_url = "https://lists.example/ai.json"
+    provider._ai_local_names = frozenset()
+    provider._ai_local_channel_ids = frozenset()
+    provider.mass = _http_session_returning("Remote Bot")
+    provider._ai_blocklist_refreshing = True
+
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    assert provider._ai_blocked_names == frozenset()
+    assert provider._ai_blocklist_refreshing is True
+
+
+def test_a_url_only_blocklist_retries_after_a_failed_first_fetch(provider):
+    """The recovery path for a config with a URL and no local entries.
+
+    The stale check used to sit behind the empty-blocklist early return, so if
+    the one fetch at startup failed there was nothing to filter, nothing to
+    schedule, and the feature stayed off for the life of the process.
+    """
+    _configure_filter(provider, blocklist="", url="https://lists.example/ai.json")
+    provider.mass = _http_session_raising(OSError("connection refused"))
+    asyncio.run(provider._refresh_remote_blocklist())
+    assert provider._ai_blocked_names == frozenset()
+
+    scheduled = []
+    provider._schedule_blocklist_refresh_if_stale = lambda: scheduled.append(1)
+    provider._drop_ai_tracks([_blocklist_track()], "radio")
+
+    assert scheduled, (
+        "a URL-only blocklist whose first fetch failed never retried, so the "
+        "filter was off for the rest of the process"
+    )
+
+
+def test_a_failed_fetch_backs_off_instead_of_retrying_every_call(provider):
+    """Without a backoff a dead URL fired a request per queue build."""
+    _configure_filter(
+        provider, blocklist="Local Bot", url="https://lists.example/ai.json"
+    )
+    provider.mass = _http_session_raising(OSError("connection refused"))
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    attempts = []
+    original = provider._refresh_remote_blocklist
+
+    async def _counting_refresh():
+        attempts.append(1)
+        await original()
+
+    provider._refresh_remote_blocklist = _counting_refresh
+    for _ in range(20):
+        provider._drop_ai_tracks([_blocklist_track()], "radio")
+
+    assert attempts == [], (
+        "a failed fetch re-armed immediately, so every filtered call refetched "
+        "a dead URL and logged a warning"
+    )
+
+
+def test_the_backoff_expires_so_a_dead_url_is_eventually_retried(provider):
+    _configure_filter(
+        provider, blocklist="Local Bot", url="https://lists.example/ai.json"
+    )
+    provider.mass = _http_session_raising(OSError("connection refused"))
+    asyncio.run(provider._refresh_remote_blocklist())
+
+    # Wind the last attempt back past the retry window.
+    provider._ai_blocklist_attempted_at = time.time() - ytm.AI_BLOCKLIST_RETRY_AFTER - 1
+
+    scheduled = []
+    provider._schedule_blocklist_refresh_if_stale = lambda: scheduled.append(1)
+    provider._drop_ai_tracks([_blocklist_track()], "radio")
+    assert scheduled
 
 
 def test_similar_tracks_are_filtered(provider):

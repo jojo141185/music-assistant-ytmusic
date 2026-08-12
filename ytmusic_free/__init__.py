@@ -74,20 +74,25 @@ DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
 
 # Longest pre-roll window we will hold a track start for. A single skippable
 # ad is around 5 seconds (issue #51 measured 4 to 5) but yt-dlp sums a whole
-# pod, and two non-skippable ads back to back reach the mid-thirties, so the
-# cap has to clear that or it would truncate legitimate waits. Past it we hand
-# the URL over regardless and accept a possible 403: one skipped track is a
-# better failure than a player that sits silent for minutes with no signal.
+# pod, and two non-skippable ads back to back reach the mid-thirties, so this
+# has to clear that or it would refuse legitimate waits.
+#
+# Past it we hand the URL over *immediately* rather than sleeping the cap and
+# handing it over anyway. Waiting 45 seconds and then serving a URL we already
+# know is still gated is the worst of both outcomes: the user gets the silence
+# and the failure. Failing at once at least skips to the next track promptly.
 MAX_PREROLL_WAIT = 45.0
 
 # ``available_at`` first appeared in yt-dlp 2025.08.20, but it only became
 # ad-derived in 2025.12.08. On the releases in between it is a flat six seconds
 # in the future on *every* non-live format, ad or not, so honouring it there
 # would put six seconds of silence in front of every single track. Older
-# releases omit the field entirely and need no guard. The manifest still allows
-# yt-dlp>=2025.1.12, and pip will not upgrade an already-satisfied requirement,
-# so that bad range is reachable on real installs and has to be excluded here
-# rather than only in the manifest floor.
+# releases omit the field entirely and need no guard.
+#
+# The manifest floor now excludes that range, but this check still has to
+# exist: pip does not upgrade an already-satisfied requirement, so an install
+# that first resolved under the old floor keeps whatever yt-dlp it landed on
+# and never sees the new one.
 MIN_YTDLP_VERSION_FOR_PREROLL = (2025, 12, 8)
 
 # Song radio and the personal mixes are effectively endless, so a full fetch has
@@ -153,6 +158,12 @@ AI_BLOCKLIST_TTL = 12 * 3600
 # Seconds to wait on the remote list before giving up. Short on purpose: a
 # slow or dead host must not delay the radio call that noticed the staleness.
 AI_BLOCKLIST_TIMEOUT = 15
+
+# How long to leave a failed fetch alone before trying again. Without this the
+# staleness check re-fires on every filtered call, because a failure never
+# advances the fetched-at stamp, producing a request per queue build and a
+# warning line to match.
+AI_BLOCKLIST_RETRY_AFTER = 600
 
 # A YouTube channel id. Used to tell "block this exact channel" apart from
 # "block anything by this artist name", because names collide and ids do not.
@@ -466,9 +477,16 @@ def _parse_blocklist(raw: str) -> tuple[frozenset[str], frozenset[str]]:
                                 break
 
     if not parsed_as_json:
+        if text.lstrip().startswith("<"):
+            # An HTML error page served with a 200, which some hosts do instead
+            # of a 404. Without this every line of it becomes a blocked artist.
+            return frozenset(), frozenset()
         for line in text.splitlines():
-            entry = line.split("#", 1)[0].strip()
-            if entry:
+            # Only a leading "#" is a comment, matching what the config field
+            # and the README promise. Splitting on any "#" would truncate a
+            # name that legitimately contains one.
+            entry = line.strip()
+            if entry and not entry.startswith("#"):
                 entries.append(entry)
 
     channel_ids = {e.strip() for e in entries if CHANNEL_ID_RE.match(e.strip())}
@@ -522,6 +540,10 @@ def _preroll_wait_seconds(fmt: dict[str, Any], now: float | None = None) -> floa
     older yt-dlp that predates the field degrades to today's behaviour rather
     than raising.
 
+    Returned uncapped. Whether a given wait is worth serving belongs to the
+    caller, which can tell "wait it out" apart from "too long to be real, fail
+    now" and act differently; clamping here would collapse the two.
+
     yt-dlp also offers ``use_ad_playback_context``, which suppresses the wait at
     the source. It is not usable here: it only takes effect on the ``mweb`` and
     ``web_music`` player clients, and pinning a client is exactly what PR #44
@@ -533,13 +555,14 @@ def _preroll_wait_seconds(fmt: dict[str, Any], now: float | None = None) -> floa
     for part in parts:
         if not isinstance(part, dict):
             continue
-        with suppress(TypeError, ValueError):
+        # OverflowError too: it is an ArithmeticError, not a ValueError, so an
+        # oversized int would otherwise escape and break the never-raise
+        # contract this docstring promises.
+        with suppress(TypeError, ValueError, OverflowError):
             available_at = max(available_at, float(part.get("available_at") or 0))
 
     wait = available_at - now
-    if wait <= 0:
-        return 0.0
-    return min(wait, MAX_PREROLL_WAIT)
+    return wait if wait > 0 else 0.0
 
 
 async def setup(
@@ -640,10 +663,13 @@ async def get_config_entries(
             default_value="",
             required=False,
             depends_on=CONF_FILTER_AI_MUSIC,
-            description="One entry per line, or separated by commas. An entry is either "
-            "an artist name or a YouTube channel id (UC...). Names match loosely, ignoring "
-            "case and extra spaces; channel ids match exactly and are the reliable choice "
-            "when two artists share a name. Lines starting with # are ignored.",
+            description="One entry per line, or separated by semicolons. An entry is "
+            "either an artist name or a YouTube channel id (UC...). Semicolons rather "
+            "than commas, because commas appear inside real names and splitting on them "
+            "would turn 'Earth, Wind & Fire' into a rule blocking everyone called Earth. "
+            "Names match loosely, ignoring case and extra spaces; channel ids match "
+            "exactly and are the reliable choice when two artists share a name. Lines "
+            "starting with # are ignored.",
         ),
         ConfigEntry(
             key=CONF_AI_BLOCKLIST_URL,
@@ -683,6 +709,9 @@ class YoutubeMusicFreeProvider(MusicProvider):
     _ai_local_channel_ids: frozenset[str] = frozenset()
     _ai_local_names: frozenset[str] = frozenset()
     _ai_blocklist_fetched_at: float = 0.0
+    # Last attempt, successful or not, so a dead URL backs off instead of
+    # re-firing on every filtered call.
+    _ai_blocklist_attempted_at: float = 0.0
     _ai_blocklist_refreshing: bool = False
     # Holds a reference to the in-flight background refresh so the event loop
     # does not garbage collect it mid-request.
@@ -1690,13 +1719,24 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # maths below, so the TTL we report is measured from the moment Music
         # Assistant actually receives the URL rather than from before the wait.
         if self._preroll_supported and (wait := _preroll_wait_seconds(stream_format)):
-            self.logger.debug(
-                "Waiting %.1fs for the pre-roll ad window on track %s before "
-                "handing over the stream url",
-                wait,
-                video_id,
-            )
-            await asyncio.sleep(wait)
+            if wait > MAX_PREROLL_WAIT:
+                self.logger.warning(
+                    "Track %s reports a %.0fs pre-roll window, beyond the %.0fs "
+                    "we are willing to hold playback for. Handing the url over "
+                    "now; it will most likely be refused with a 403 and the "
+                    "track skipped.",
+                    video_id,
+                    wait,
+                    MAX_PREROLL_WAIT,
+                )
+            else:
+                self.logger.debug(
+                    "Waiting %.1fs for the pre-roll ad window on track %s before "
+                    "handing over the stream url",
+                    wait,
+                    video_id,
+                )
+                await asyncio.sleep(wait)
 
         url = stream_format["url"]
         expiration = DEFAULT_STREAM_URL_EXPIRATION
@@ -2054,10 +2094,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
         self._ai_filter_enabled = bool(self.config.get_value(CONF_FILTER_AI_MUSIC))
         self._ai_blocklist_url = str(self.config.get_value(CONF_AI_BLOCKLIST_URL) or "").strip()
         raw = str(self.config.get_value(CONF_AI_BLOCKLIST) or "")
-        # Commas are accepted alongside newlines because a single-line config
-        # box is what most people will actually be typing into.
+        # Semicolons, not commas. A single-line config box needs some in-line
+        # separator, and commas are far too common inside real artist names:
+        # splitting on them turns "Earth, Wind & Fire" into a rule that blocks
+        # every artist called "Earth". Semicolons effectively never appear in
+        # a name, so they separate unambiguously.
         self._ai_local_channel_ids, self._ai_local_names = _parse_blocklist(
-            raw.replace(",", "\n")
+            raw.replace(";", "\n")
         )
         self._ai_blocked_channel_ids = self._ai_local_channel_ids
         self._ai_blocked_names = self._ai_local_names
@@ -2081,6 +2124,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if not url or self._ai_blocklist_refreshing:
             return
         self._ai_blocklist_refreshing = True
+        # Stamped before the attempt, not after it, so the backoff applies to a
+        # failure too. Only advancing this on success is what let a dead URL
+        # re-fire on every single filtered call.
+        self._ai_blocklist_attempted_at = time.time()
         try:
             # Imported here rather than at module scope: aiohttp is guaranteed
             # inside Music Assistant but is not a declared test dependency, and
@@ -2133,7 +2180,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
             return
         if self._ai_blocklist_refreshing:
             return
-        if time.time() - self._ai_blocklist_fetched_at < AI_BLOCKLIST_TTL:
+        now = time.time()
+        if self._ai_blocklist_fetched_at and now - self._ai_blocklist_fetched_at < AI_BLOCKLIST_TTL:
+            return
+        if now - self._ai_blocklist_attempted_at < AI_BLOCKLIST_RETRY_AFTER:
             return
         with suppress(RuntimeError):
             # RuntimeError when there is no running loop, which only happens in
@@ -2163,9 +2213,17 @@ class YoutubeMusicFreeProvider(MusicProvider):
         """
         if not self._ai_filter_enabled:
             return tracks
+        # Ahead of the empty-list exit, not after it. A config with only a
+        # remote URL starts with both sets empty, so gating the refresh on
+        # having entries meant that if the one fetch at startup failed, nothing
+        # ever retried and the filter stayed off for the process lifetime.
+        # Ahead of the empty-list exit, not after it. A config with only a
+        # remote URL starts with both sets empty, so gating the refresh on
+        # having entries meant that if the one fetch at startup failed, nothing
+        # ever retried and the filter stayed off for the process lifetime.
+        self._schedule_blocklist_refresh_if_stale()
         if not self._ai_blocked_channel_ids and not self._ai_blocked_names:
             return tracks
-        self._schedule_blocklist_refresh_if_stale()
         kept = [track for track in tracks if not self._is_ai_blocked(track)]
         if dropped := len(tracks) - len(kept):
             self.logger.debug(
