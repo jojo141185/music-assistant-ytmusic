@@ -16,13 +16,32 @@ REPO_OWNER="sproft"
 REPO_NAME="music-assistant-ytmusic"
 ADDON_SLUG="ma_provider_watcher"
 ADDON_NAME="MA Provider Watcher"
-# Stamp a fresh, strictly-increasing version on every run so Home Assistant sees
-# a newer version and rebuilds the add-on image. Without this the version stays
-# pinned, so re-running the installer (e.g. to fix the Python version or MA ID)
-# silently keeps the stale cached image with the old run.sh -- issue #22.
-ADDON_VERSION="1.0.$(date +%Y%m%d%H%M%S)"
+# The add-on's own version line, deliberately NOT the provider's.
+#
+# It cannot track the provider version, because it has to be strictly greater
+# than what existing installs already carry and those carry "1.0.<14-digit
+# timestamp>" from the scheme this replaces. Home Assistant orders 1.0.0.x BELOW
+# 1.0.20260813112233 -- it compares the third section, 0 against a 14-digit
+# number -- so anything on the 1.x line would strand every current user on a
+# version they can never update from. Starting a 2.x line clears that.
+#
+# The provider version is what people actually need in a bug report, so it is
+# reported separately: in the add-on description below, and by the watcher on
+# every start. Issue #68.
+ADDON_VERSION_LINE="2.0.0"
 
-REF="main"
+# Still timestamped, so the version is strictly greater on every run and Home
+# Assistant rebuilds the image. Without that, re-running the installer to fix
+# the Python version or MA ID silently keeps the stale cached run.sh (issue
+# #22). A content hash would avoid the occasional update prompt for identical
+# code, but hashes have no order, and Home Assistant's update entity needs a
+# strictly greater version to enable the Install button. A missed rebuild is
+# the more expensive failure, so the timestamp stays.
+ADDON_VERSION="$ADDON_VERSION_LINE.$(date +%Y%m%d%H%M%S)"
+
+# Empty means "resolve the newest published release". --ref pins to a branch,
+# tag or commit, and pinning also stops auto-update from following releases.
+REF=""
 FORCE=0
 MA_ID=""
 PYTHON_VERSION=""
@@ -31,6 +50,48 @@ ADDONS_DIR=""
 log()  { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# Print the newest published release tag, or fail if there is not one.
+#
+# Follows the redirect on the HTML /releases/latest rather than reading the JSON
+# API, because that needs no jq: jq is not a dependency of this script and is
+# absent from a stock HAOS BusyBox. GitHub excludes prereleases from "latest",
+# so publishing a release candidate does not change what new installs get. When
+# no non-prerelease exists the redirect lands on /releases with no /tag/
+# segment, which is the "no releases yet" case.
+latest_release_tag() {
+    _resolved="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest" 2>/dev/null)" \
+        || return 1
+    case "$_resolved" in
+        */releases/tag/*) printf '%s\n' "${_resolved##*/releases/tag/}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Pick the ref to install when --ref was not given, and record whether the
+# add-on should keep following releases afterwards.
+#
+# Falls back to main rather than aborting: no release yet, a GitHub outage and a
+# rate-limited host all land here, and refusing to install would be a worse
+# answer than installing branch head and saying so loudly. TRACK_RELEASES stays
+# 1 in that case, so a watcher installed during an outage starts following
+# releases as soon as it can reach GitHub again.
+TRACK_RELEASES=0
+resolve_ref() {
+    if [ -n "$REF" ]; then
+        log "Pinned to --ref $REF; auto-update will follow it rather than releases."
+        return 0
+    fi
+    TRACK_RELEASES=1
+    if REF="$(latest_release_tag)" && [ -n "$REF" ]; then
+        log "Installing the latest release: $REF"
+    else
+        REF="main"
+        log "WARN: could not resolve a published release (none yet, or GitHub"
+        log "      unreachable). Falling back to branch head: $REF"
+    fi
+}
 
 # A candidate is only usable if it is a directory we can actually write into.
 # Some add-ons mount the add-ons share read-only (or owned by another uid), so
@@ -88,6 +149,11 @@ need tar
 need mkdir
 need cp
 need rm
+
+# --- Resolve the ref to install ----------------------------------------------
+#
+# After the preflight, because it needs curl.
+resolve_ref
 
 # --- Detect add-ons directory -----------------------------------------------
 
@@ -208,7 +274,9 @@ fi
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t maw)"
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 
-TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+# Bare ref rather than refs/heads/$REF: this form resolves a branch, a tag and a
+# full commit sha identically. refs/heads/ 404s on every tag.
+TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF"
 log "Downloading $TARBALL_URL"
 curl -fsSL "$TARBALL_URL" -o "$TMPDIR/repo.tar.gz" \
     || die "download failed (check --ref or your network)"
@@ -217,11 +285,27 @@ log "Extracting..."
 tar -xzf "$TMPDIR/repo.tar.gz" -C "$TMPDIR" \
     || die "extraction failed (corrupt archive?)"
 
-# Tarball top-level dir is "<repo>-<ref>" with slashes in ref replaced by '-'.
-SAFE_REF="$(printf '%s' "$REF" | tr '/' '-')"
-SRC_ROOT="$TMPDIR/$REPO_NAME-$SAFE_REF"
-[ -d "$SRC_ROOT/ytmusic_free" ] \
-    || die "ytmusic_free/ not found in archive at $SRC_ROOT"
+# Discover the extracted directory rather than computing it. It is normally
+# "<repo>-<ref>", but GitHub strips a leading "v" from tag names, so v1.0.0
+# extracts to "<repo>-1.0.0" and the computed guess misses by one character.
+# Looking for the directory that actually holds the provider makes branch, tag
+# and commit behave the same.
+SRC_ROOT=""
+for _candidate in "$TMPDIR"/*/; do
+    if [ -d "$_candidate""ytmusic_free" ]; then
+        SRC_ROOT="${_candidate%/}"
+        break
+    fi
+done
+[ -n "$SRC_ROOT" ] && [ -d "$SRC_ROOT/ytmusic_free" ] \
+    || die "ytmusic_free/ not found in the archive downloaded from $TARBALL_URL"
+
+# The number a bug report needs. The add-on carries its own version line (see
+# ADDON_VERSION_LINE above), so this is surfaced in the description instead.
+PROVIDER_VERSION="$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' \
+    "$SRC_ROOT/ytmusic_free/__init__.py" 2>/dev/null | head -n1)"
+[ -n "$PROVIDER_VERSION" ] || PROVIDER_VERSION="unknown"
+log "Bundling provider version $PROVIDER_VERSION"
 
 # --- Build the add-on directory ---------------------------------------------
 
@@ -242,7 +326,7 @@ done
 log "Writing config.yaml"
 cat > "$ADDON_DIR/config.yaml" <<EOF
 name: "$ADDON_NAME"
-description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
+description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart. Bundles provider $PROVIDER_VERSION (from $REF)."
 version: "$ADDON_VERSION"
 slug: $ADDON_SLUG
 init: false
@@ -338,9 +422,32 @@ read_options() {
 # add-on rebuilds.
 provider_src() { if [ "${AUTO_UPDATE:-false}" = "true" ] && [ -d "$CACHE" ]; then printf '%s' "$CACHE"; else printf '%s' "$BUNDLED"; fi; }
 
+# Re-resolve the newest release before each fetch, unless the install was
+# pinned with --ref. Without this the watcher would sit on whatever tag was
+# current when it was installed and never see a later release.
+#
+# Always returns 0. A failure here keeps the URL we already had, which is the
+# documented contract: a fetch that cannot reach GitHub leaves the running
+# provider alone rather than failing the watcher.
+resolve_tarball_url() {
+    [ "${TRACK_RELEASES:-0}" = "1" ] || return 0
+    _u="$(curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null \
+        -w '%{url_effective}' \
+        "https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest" 2>/dev/null)" || return 0
+    case "$_u" in
+        */releases/tag/*)
+            REF="${_u##*/releases/tag/}"
+            TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF"
+            ;;
+    esac
+    return 0
+}
+
 # Fetch the latest provider from GitHub into $CACHE.
 # Return: 0 = updated (changed), 2 = unchanged, 1 = fetch/parse failed.
+# On 0, FETCHED_VERSION holds the version that was cached.
 fetch_latest() {
+    resolve_tarball_url
     tmp="$(mktemp -d 2>/dev/null || mktemp -d -t maw)" || return 1
     if ! curl -fsSL --connect-timeout 10 --max-time 120 "$TARBALL_URL" -o "$tmp/p.tgz" 2>/dev/null; then
         echo "auto-update: download failed"; rm -rf "$tmp"; return 1
@@ -362,7 +469,11 @@ fetch_latest() {
     mkdir -p "$CACHE.new" && cp -a "$nd/." "$CACHE.new/" || { rm -rf "$tmp" "$CACHE.new"; return 1; }
     rm -rf "$CACHE" && mv "$CACHE.new" "$CACHE" || { rm -rf "$tmp"; return 1; }
     printf '%s\n' "$nh" > "$HASHFILE"
-    echo "auto-update: cached new provider ($nh)"
+    # Read it from the cache rather than $nd, which is about to be deleted.
+    FETCHED_VERSION="$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' \
+        "$CACHE/__init__.py" 2>/dev/null | head -n1)"
+    [ -n "$FETCHED_VERSION" ] || FETCHED_VERSION="unknown"
+    echo "auto-update: cached provider $FETCHED_VERSION from $REF ($nh)"
     rm -rf "$tmp"; return 0
 }
 LIBEOF
@@ -376,9 +487,20 @@ BUNDLED="/provider/ytmusic_free"
 CACHE="/data/ytmusic_free"
 HASHFILE="/data/ytmusic_free.sha256"
 DST="/app/venv/lib/$PYTHON_VERSION/site-packages/music_assistant/providers"
-# Where auto-update pulls the latest provider from. Baked from the installer's
+# Where auto-update pulls the provider from. Baked from the installer's
 # --repo-owner/--ref so a fork self-updates from its own source.
-TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+REPO_OWNER="$REPO_OWNER"
+REPO_NAME="$REPO_NAME"
+REF="$REF"
+TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF"
+# 1 when the install resolved a release rather than being pinned with --ref. The
+# watcher then re-resolves the newest release on every poll, so a new release is
+# picked up instead of the tag being frozen at install time. A --ref install
+# stays on exactly what was asked for.
+TRACK_RELEASES=$TRACK_RELEASES
+# The provider version baked into this image, reported on start so a bug report
+# can name it without digging through Music Assistant's own log.
+BUNDLED_VERSION="$PROVIDER_VERSION"
 # How long to wait for the configured MA container to appear before logging a
 # loud ERROR. Catches the case where the installer's auto-detect fallback
 # baked in a container name that does not exist on this host (issue #11).
@@ -390,6 +512,7 @@ MISSING_GRACE_SECONDS=60
 read_options
 
 echo "[\$(date)] MA Provider Watcher starting..."
+echo "[\$(date)] Add-on $ADDON_VERSION, bundling provider \$BUNDLED_VERSION from $REF"
 echo "[\$(date)] Watching for container name: \$MA"
 
 if ! docker info > /dev/null 2>&1; then
@@ -519,7 +642,10 @@ while true; do
         if [ \$((now - LAST_UPDATE)) -ge "\$UPDATE_INTERVAL" ]; then
             LAST_UPDATE=\$now
             if fetch_latest; then
-                log "auto-update: new provider version detected -> reinstalling"
+                # Names the version rather than claiming one. Before releases
+                # existed this line said "new provider version detected" when
+                # what it had actually seen was a changed sha256 (issue #68).
+                log "auto-update: provider \$FETCHED_VERSION is new here -> reinstalling"
                 CUR_ID=\$(docker ps -q --no-trunc --filter name="\$MA" 2>/dev/null)
                 if [ -n "\$CUR_ID" ]; then LAST_ID="\$CUR_ID"; install_provider; fi
             fi

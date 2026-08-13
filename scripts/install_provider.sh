@@ -26,7 +26,10 @@ REPO_OWNER="sproft"
 REPO_NAME="music-assistant-ytmusic"
 PROVIDER_DIR="ytmusic_free"
 
-REF="main"
+# Empty means "resolve the newest published release". --ref overrides it with a
+# branch, tag or commit. Installing a release rather than branch head is what
+# makes an install reproducible and lets a bug report name a version. See #68.
+REF=""
 FORCE=0
 MA_ID=""
 PYTHON_VERSION=""
@@ -37,6 +40,42 @@ NO_STAGE=0
 log()  { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# Print the newest published release tag, or fail if there is not one.
+#
+# Follows the redirect on the HTML /releases/latest rather than reading the JSON
+# API, because that needs no jq: jq is not a dependency of this script and is
+# absent from a stock HAOS BusyBox. GitHub excludes prereleases from "latest",
+# which is what lets a release candidate be published without becoming every
+# new install's default. When no non-prerelease exists the redirect lands on
+# /releases with no /tag/ segment, and that is the "no releases yet" case.
+latest_release_tag() {
+    _resolved="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest" 2>/dev/null)" \
+        || return 1
+    case "$_resolved" in
+        */releases/tag/*) printf '%s\n' "${_resolved##*/releases/tag/}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Pick the ref to install when --ref was not given.
+#
+# Falls back to main rather than aborting. A brand-new repo with no release yet,
+# a GitHub outage and a rate-limited runner all land here, and refusing to
+# install at all would be a worse answer than installing branch head and saying
+# so. The message is deliberately loud, because an install that silently means
+# something different from what the docs promise is how support threads start.
+resolve_ref() {
+    [ -n "$REF" ] && return 0
+    if REF="$(latest_release_tag)" && [ -n "$REF" ]; then
+        log "Installing the latest release: $REF"
+    else
+        REF="main"
+        log "WARN: could not resolve a published release (none yet, or GitHub"
+        log "      unreachable). Falling back to branch head: $REF"
+    fi
+}
 
 # 'docker' missing is the single most common install failure on HAOS, because
 # the official Terminal & SSH add-on is sandboxed and cannot reach the host
@@ -67,7 +106,9 @@ Usage: sh install_provider.sh [options]
 Options:
   --force, -f               Skip overwrite prompts
   --repo-owner OWNER        Repository owner (default: sproft)
-  --ref REF                 Git ref (branch/tag/commit) to download (default: main)
+  --ref REF                 Git ref (branch/tag/commit) to download
+                            (default: the newest published release; use
+                            --ref main to track branch head instead)
   --ma-id ID                Music Assistant container ID (default: auto-detect)
   --python-version VER      MA Python version, e.g. python3.13 (default: auto-detect)
   --config-dir DIR          /config directory on the host
@@ -98,7 +139,9 @@ done
 # --repo-owner / --ref, and (crucially) shows the "sh -s --" pipe form: the
 # documented install is "curl ... | sh", where a bare "--flag" is parsed by sh
 # itself and fails with "sh: bad option".
-SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REF/scripts/install_provider.sh"
+# ${REF:-main} because REF is empty until resolve_ref runs, and these hints are
+# printed by failures that happen before it does.
+SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/${REF:-main}/scripts/install_provider.sh"
 
 # --- Preflight ---------------------------------------------------------------
 
@@ -109,6 +152,12 @@ need mkdir
 need cp
 need rm
 need_docker
+
+# --- Resolve the ref to install ----------------------------------------------
+#
+# After the preflight, because it needs curl, and before anything that reports
+# what is about to be installed.
+resolve_ref
 
 # --- Detect MA container -----------------------------------------------------
 
@@ -214,7 +263,10 @@ fi
 TMPDIR="$(mktemp -d 2>/dev/null || mktemp -d -t mip)"
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 
-TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/refs/heads/$REF"
+# Bare ref rather than refs/heads/$REF: this form resolves a branch, a tag and a
+# full commit sha identically, which is what --ref has claimed to accept all
+# along. refs/heads/ 404s on every tag.
+TARBALL_URL="https://codeload.github.com/$REPO_OWNER/$REPO_NAME/tar.gz/$REF"
 log "Downloading $TARBALL_URL"
 curl -fsSL "$TARBALL_URL" -o "$TMPDIR/repo.tar.gz" \
     || die "download failed (check --ref or your network)"
@@ -223,10 +275,20 @@ log "Extracting..."
 tar -xzf "$TMPDIR/repo.tar.gz" -C "$TMPDIR" \
     || die "extraction failed (corrupt archive?)"
 
-SAFE_REF="$(printf '%s' "$REF" | tr '/' '-')"
-SRC_ROOT="$TMPDIR/$REPO_NAME-$SAFE_REF"
-[ -d "$SRC_ROOT/$PROVIDER_DIR" ] \
-    || die "$PROVIDER_DIR/ not found in archive at $SRC_ROOT"
+# Discover the extracted directory rather than computing it. It is normally
+# "<repo>-<ref>", but GitHub strips a leading "v" from tag names, so a tag like
+# v1.0.0 extracts to "<repo>-1.0.0" and the computed guess misses by one
+# character. Looking for the directory that actually contains the provider
+# makes branch, tag and commit behave the same.
+SRC_ROOT=""
+for _candidate in "$TMPDIR"/*/; do
+    if [ -d "$_candidate$PROVIDER_DIR" ]; then
+        SRC_ROOT="${_candidate%/}"
+        break
+    fi
+done
+[ -n "$SRC_ROOT" ] && [ -d "$SRC_ROOT/$PROVIDER_DIR" ] \
+    || die "$PROVIDER_DIR/ not found in the archive downloaded from $TARBALL_URL"
 
 # --- Stage to /config -------------------------------------------------------
 

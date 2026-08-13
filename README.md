@@ -29,6 +29,8 @@ The Music Assistant maintainers have stated more than once that they do not want
 
 Keeping these reports here respects the Music Assistant team's wishes and keeps them out of a project they have asked not to be involved with.
 
+**What gets installed.** Both install scripts fetch the newest published [release](https://github.com/sproft/music-assistant-ytmusic/releases) by default, so an install is reproducible and a bug report can name a version. Pass `--ref main` to track branch head instead, or `--ref v1.2.3` to pin an older release. If no release has been published yet, or GitHub is unreachable, the scripts fall back to branch head and say so in their output.
+
 **Please include the version.** The provider logs it on every start, as the first line it writes:
 
 ```

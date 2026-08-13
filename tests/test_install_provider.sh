@@ -131,6 +131,35 @@ fi
 # with "sh: bad option" (issue #35). Guard the fix against regressing.
 src="$(cat "$SCRIPT")"
 assert_contains "re-run hints use the sh -s -- separator" "sh -s --" "$src"
+
+# --- Release-tracking install (issue #68) ------------------------------------
+#
+# Installing a published release rather than branch head is what makes an
+# install reproducible and lets a bug report name a version.
+
+assert_contains "resolves the newest release when --ref is absent" \
+    "latest_release_tag()" "$src"
+assert_contains "falls back rather than aborting when there is no release" \
+    'REF="main"' "$src"
+# The bare tar.gz form resolves a branch, a tag and a commit identically.
+# refs/heads/ 404s on every tag, which is what made --ref <tag> unusable.
+# shellcheck disable=SC2016  # matching the literal text "$REF" in the source
+assert_contains "downloads with the ref-agnostic tarball form" \
+    'tar.gz/$REF' "$src"
+case "$src" in
+    *'tar.gz/refs/heads/'*) fail "does not hardcode refs/heads in the tarball URL" ;;
+    *) pass "does not hardcode refs/heads in the tarball URL" ;;
+esac
+# GitHub strips a leading "v" from tag names in the archive's top-level
+# directory, so v1.0.0 extracts to "<repo>-1.0.0". Computing the name from the
+# ref misses by one character and the install dies with "not found in archive".
+# shellcheck disable=SC2016  # matching the literal old expression in the source
+case "$src" in
+    *'SRC_ROOT="$TMPDIR/$REPO_NAME-$SAFE_REF"'*)
+        fail "discovers the extracted directory instead of computing it" ;;
+    *) pass "discovers the extracted directory instead of computing it" ;;
+esac
+assert_contains "help explains the release default" "newest published release" "$src"
 case "$src" in
     *"then re-run with --ma-id ID"*) fail "no bare 're-run with --ma-id ID' hint remains" ;;
     *) pass "no bare 're-run with --ma-id ID' hint remains" ;;
