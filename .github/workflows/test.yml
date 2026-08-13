@@ -4,6 +4,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly, because several jobs here install upstream unpinned and can only go
+  # red once somebody else publishes. models-contract resolves whatever
+  # music_assistant_models is current (roughly a release a day), and the docker
+  # job builds FROM ghcr.io/music-assistant/server:latest, which moves every day
+  # or two. On push and pull_request alone CI only looks when we happen to
+  # commit, so the first person to find out that upstream moved is a user on a
+  # nightly.
+  #
+  # 06:23 UTC. Off the hour because jobs scheduled at :00 queue behind everyone
+  # else's cron and get delayed, and late enough to clear both upstream release
+  # windows (the models bot lands 02:40-03:05, the server prerelease around
+  # 04:20). Does not collide with live-extraction.yml at 05:17.
+  #
+  # Note GitHub disables scheduled workflows after 60 days with no repository
+  # activity, so a long quiet spell turns this off silently. Re-enable from the
+  # Actions tab.
+  schedule:
+    - cron: "23 6 * * *"
+  # So a drift check can be run on demand rather than waiting for the cron.
+  workflow_dispatch:
 
 jobs:
   shell:
@@ -151,3 +171,21 @@ jobs:
               exit 1
             fi
           '
+
+      - name: Assert the provider imports against real Music Assistant
+        run: |
+          # The step above proves the files landed. This one proves they load.
+          #
+          # ytmusic_free imports five symbols from the music_assistant *server*
+          # package at module scope, and nothing else in CI ever executes them:
+          # the unit suite replaces music_assistant with a stub, and
+          # models-contract installs only music_assistant_models. The server
+          # package is not on PyPI (upstream ships it as a release asset), so
+          # this image is the only cheap place a real import can happen, and it
+          # is the exact environment users run. Issue #66.
+          #
+          # Piped on stdin rather than mounted so the check needs no volume and
+          # no path arithmetic; see tests/verify_server_contract.py for what it
+          # asserts and why.
+          docker run --rm -i --entrypoint /app/venv/bin/python \
+            local-test-image:latest - < tests/verify_server_contract.py
