@@ -11,6 +11,18 @@ on:
       - 'Dockerfile'
       - '.dockerignore'
       - '.github/workflows/docker-publish.yml'
+  # Called by release.yml on a version tag. Reusable rather than a `tags:` entry
+  # under `push:` above, because `paths:` applies to every push filter and a tag
+  # push has no path diff to match, so the build would silently never run.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: >-
+          Version tag being released, e.g. v1.0.0. Set only by release.yml.
+          Empty on push/schedule/dispatch runs, which publish channel tags only.
+        type: string
+        required: false
+        default: ""
   workflow_dispatch:
     # Allows manual triggers
 
@@ -53,14 +65,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Materialise the input as an env var so the tag expressions below compare
+      # a real string. On push/schedule/dispatch runs `inputs` is empty and this
+      # writes RELEASE_TAG= (empty), with no reliance on how GitHub coerces null.
+      - name: Resolve release tag
+        run: echo "RELEASE_TAG=${{ inputs.release_tag }}" >> "$GITHUB_ENV"
+
       - name: Extract Docker metadata (for immutable tags)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # matrix.version is the UPSTREAM Music Assistant channel, so `:latest`
+          # here means "built on music-assistant/server:latest", not "newest
+          # ytmusic_free". Release builds must not reuse those names, so they add
+          # their own:
+          #   v1.0.0-latest  provider v1.0.0 on the MA latest channel
+          #   v1.0.0-beta    provider v1.0.0 on the MA beta channel
+          #   v1.0.0         alias for the latest-channel build
           tags: |
             type=raw,value=${{ matrix.version }}
             type=raw,value=${{ matrix.version }}-${{ github.run_id }}
+            type=raw,value=${{ env.RELEASE_TAG }}-${{ matrix.version }},enable=${{ env.RELEASE_TAG != '' }}
+            type=raw,value=${{ env.RELEASE_TAG }},enable=${{ env.RELEASE_TAG != '' && matrix.version == 'latest' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6

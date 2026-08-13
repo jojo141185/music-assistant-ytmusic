@@ -1,0 +1,104 @@
+name: release
+
+# Releases are cut by pushing a tag. Nothing here decides the version: it lives
+# in the repo as ytmusic_free.__version__, and this workflow refuses to publish
+# when the tag disagrees with it, so a release and the code inside it can never
+# claim different numbers.
+#
+#   1. bump __version__ in ytmusic_free/__init__.py, merge that to main
+#   2. git tag -a v1.2.3 -m 'v1.2.3' && git push origin v1.2.3
+#
+# A semver pre-release suffix (v1.2.3-rc.1) publishes as a GitHub prerelease.
+# That is load-bearing rather than cosmetic: the install scripts resolve the
+# latest *release*, and GitHub excludes prereleases from that, so an rc must not
+# become the default install for everyone.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read-only by default; only the publish job widens it.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.repo.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag is semver with a leading v
+        id: tag
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s\n' "$tag" \
+               | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$tag' is not vMAJOR.MINOR.PATCH[-prerelease][+build]" >&2
+            exit 1
+          fi
+          case "$tag" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Read the version recorded in the repo
+        id: repo
+        run: |
+          version="$(python .github/scripts/read_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "recorded version: $version"
+
+      - name: Fail if the tag and the recorded version disagree
+        run: |
+          expected="v${{ steps.repo.outputs.version }}"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' does not match ytmusic_free.__version__ ('$expected')." >&2
+            echo "Bump __version__ in ytmusic_free/__init__.py, merge that, then re-tag." >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches the recorded version"
+
+  # Reuses test.yml rather than restating it, so a release can never run a stale
+  # copy of the suite.
+  test:
+    needs: verify-version
+    uses: ./.github/workflows/test.yml
+
+  # Deliberately NOT a dependency of `publish`. The image is one optional way to
+  # run the provider; the tarball the install scripts download is the release. A
+  # ghcr outage should not withhold the thing users actually install.
+  docker:
+    needs: [verify-version, test]
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      packages: write
+
+  publish:
+    needs: [verify-version, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.verify-version.outputs.prerelease }}
+        run: |
+          set -- --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+          if [ "$PRERELEASE" = "true" ]; then
+            set -- "$@" --prerelease
+          else
+            set -- "$@" --latest
+          fi
+          gh release create "$TAG" "$@"

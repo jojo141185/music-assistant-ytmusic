@@ -13,6 +13,19 @@ apps like SimpMusic work. This may break if YouTube changes their API.
 
 from __future__ import annotations
 
+# The one place this provider's version is recorded. A release is cut by pushing
+# a tag, and .github/workflows/release.yml refuses to publish when the tag and
+# this string disagree, so a release and the code inside it can never claim
+# different numbers.
+#
+# It lives here rather than in manifest.json for two reasons. Only the
+# ytmusic_free/ directory ships (.dockerignore is "*" then "!ytmusic_free", and
+# both installers copy just this directory), so a repo-root VERSION file would
+# never reach an install. And Music Assistant would throw it away anyway:
+# ProviderManifest has no version field and mashumaro drops unknown keys, so the
+# manifest object handed to the provider never carries one. See issue #68.
+__version__ = "1.0.0"
+
 import asyncio
 import importlib
 import json
@@ -899,6 +912,12 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
     async def handle_async_init(self) -> None:
         """Set up the YTMusicFree provider."""
+        # First line out of the provider on every start, and deliberately before
+        # anything that can fail. Bug reports arrive as log excerpts, and until
+        # this existed the only answer to "which build are you running?" was
+        # "whatever main was on the day I installed". Logged rather than read
+        # from the manifest because Music Assistant drops the key. Issue #68.
+        self.logger.info("YouTube Music (Free) provider version %s", __version__)
         logging.getLogger("yt_dlp").setLevel(logging.WARNING)
         await self._install_packages()
         await self._purge_legacy_auth_file()

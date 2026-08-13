@@ -1,6 +1,10 @@
 name: test
 
 on:
+  # Called by release.yml so a tag runs the same suite main does, from one
+  # definition rather than a copy that can go stale. No inputs and no secrets:
+  # everything here is offline or public.
+  workflow_call:
   push:
     branches: [main]
   pull_request:
