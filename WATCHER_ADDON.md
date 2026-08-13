@@ -37,7 +37,7 @@ Optionally, the watcher can also keep the provider **up to date**: enable `auto_
 ```yaml
 name: "MA Provider Watcher"
 description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
-version: "1.0.0"  # the installer stamps a fresh "1.0.<timestamp>" on each run so HA detects the change
+version: "2.0.0"  # the installer stamps a fresh "2.0.0.<timestamp>" on each run so HA detects the change
 slug: ma_provider_watcher
 init: false
 boot: auto
@@ -187,7 +187,7 @@ The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instea
 
 Common flags:
 - `--force`: overwrite an existing install without prompting
-- `--ref TAG`: pin to a release tag instead of `main`
+- `--ref REF`: pin to a branch, tag or commit instead of the newest release. `--ref main` tracks branch head, which is what the installer used to do by default
 - `--ma-id ID` / `--python-version pythonX.Y`: override auto-detection
 - `--addons-dir DIR`: skip path auto-detection (useful for non-standard installs)
 
@@ -294,14 +294,14 @@ Set these in the add-on's **Configuration** tab (or `options` in `config.yaml`):
 | `auto_update` | bool | `false` | Off by default (opt-in). When on, the watcher periodically checks GitHub for a newer provider and reinstalls it. Note it then runs branch-head code inside MA unattended. Leave off to pin to the version baked into the image. |
 | `update_interval_hours` | int (hours) | `24` | How often to check. `24` = daily, `168` = weekly, `1` = hourly. Clamped to a minimum of `1` at runtime; invalid values fall back to the default. |
 
-Auto-update follows the **branch head** given by `--ref` (default `main`); it does not resolve tags or commit SHAs.
+Auto-update follows **published releases** by default: it re-resolves the newest release before every check, so a release published after you installed is picked up. Installing with `--ref` pins that instead, and the watcher then follows exactly what you asked for, whether that is a branch head, a tag or a commit.
 
 ### How it works
 
-1. On startup (and every `update_interval_hours` hours thereafter), the watcher downloads the provider tarball for the configured `--ref` (default `main`) from GitHub into a cache under `/data`.
+1. On startup (and every `update_interval_hours` hours thereafter), the watcher resolves the newest release (unless pinned with `--ref`) and downloads that provider tarball from GitHub into a cache under `/data`.
 2. It compares the SHA-256 of the fetched `ytmusic_free/` against what's already cached.
 3. **Only if the code changed**, it copies the new files into the MA container and restarts MA. Unchanged fetches are a no-op, so no needless restarts.
-4. If a fetch fails (offline, GitHub down), the watcher logs a warning and keeps using the currently installed version. It never leaves MA without a provider.
+4. If a fetch fails (offline, GitHub down), the watcher logs a warning and keeps using the currently installed version. It never leaves MA without a provider. A release lookup that fails is the same: it keeps using the last one it knows about rather than falling back to branch head behind your back.
 
 Once a newer version has been cached, it also survives MA container recreation: the watcher installs from the cache in preference to the image-baked copy.
 

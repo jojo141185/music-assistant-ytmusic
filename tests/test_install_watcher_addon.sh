@@ -234,12 +234,29 @@ if [ "$network_ok" = "1" ]; then
     assert_contains "config.yaml has slug"      "slug: ma_provider_watcher" "$config"
     assert_contains "config.yaml has docker_api" "docker_api: true"          "$config"
     assert_contains "config.yaml has boot auto"  "boot: auto"                "$config"
-    # Version must be build-stamped (1.0.<timestamp>), not the static "1.0.0",
-    # so HA detects a change and rebuilds the cached image on re-run (issue #22).
-    assert_contains "config.yaml version is build-stamped" 'version: "1.0.2' "$config"
+    # Version must be build-stamped (2.0.0.<timestamp>), not static, so HA
+    # detects a change and rebuilds the cached image on re-run (issue #22).
+    assert_contains "config.yaml version is build-stamped" 'version: "2.0.0.2' "$config"
     case "$config" in
-        *'version: "1.0.0"'*) fail "config.yaml version is not the static 1.0.0" ;;
-        *) pass "config.yaml version is not the static 1.0.0" ;;
+        *'version: "2.0.0"'*) fail "config.yaml version is not the static 2.0.0" ;;
+        *) pass "config.yaml version is not the static 2.0.0" ;;
+    esac
+    # The add-on must be on a 2.x line. Existing installs carry
+    # "1.0.<14-digit timestamp>", and Home Assistant orders every 1.0.0.x below
+    # that (it compares the third section, 0 against a 14-digit number), so a
+    # 1.x version would leave every current user unable to update. Issue #68.
+    case "$config" in
+        *'version: "1.'*) fail "config.yaml version clears the legacy 1.0.<timestamp> line" ;;
+        *) pass "config.yaml version clears the legacy 1.0.<timestamp> line" ;;
+    esac
+    # The provider version belongs in the description, because the add-on's own
+    # version line cannot carry it (see above). "unknown" would mean the
+    # installer failed to read __version__ out of the tarball.
+    assert_contains "description names the bundled provider version" \
+        "Bundles provider " "$config"
+    case "$config" in
+        *'Bundles provider unknown'*) fail "bundled provider version was read from the tarball" ;;
+        *) pass "bundled provider version was read from the tarball" ;;
     esac
 
     runsh="$(cat "$ADDON/run.sh")"
@@ -266,6 +283,30 @@ if [ "$network_ok" = "1" ]; then
     esac
     assert_contains "run.sh references MISSING_GRACE_SECONDS" "MISSING_GRACE_SECONDS" "$runsh"
     assert_contains "run.sh diagnostic mentions --ma-id remedy" "--ma-id" "$runsh"
+
+    # Issue #68: releases.
+    #
+    # The bare tar.gz form resolves a branch, a tag and a commit identically.
+    # refs/heads/ 404s on every tag, which is what made --ref <tag> unusable.
+    assert_contains "run.sh fetches with the ref-agnostic tarball form" \
+        "/tar.gz/" "$runsh"
+    case "$runsh" in
+        *"tar.gz/refs/heads/"*) fail "run.sh does not hardcode refs/heads" ;;
+        *) pass "run.sh does not hardcode refs/heads" ;;
+    esac
+    assert_contains "run.sh carries the release-tracking flag" "TRACK_RELEASES=" "$runsh"
+    assert_contains "run.sh reports the bundled provider version on start" \
+        "BUNDLED_VERSION" "$runsh"
+    # The log line used to claim it had seen a new "version" when all it had
+    # compared was a sha256. With releases it can name one.
+    # shellcheck disable=SC2016  # matching the literal text "$FETCHED_VERSION"
+    assert_contains "run.sh auto-update log names the version" \
+        'provider $FETCHED_VERSION' "$runsh"
+
+    lib="$(cat "$ADDON/watcher_lib.sh")"
+    assert_contains "watcher_lib re-resolves the release before each fetch" \
+        "resolve_tarball_url" "$lib"
+    assert_contains "watcher_lib records the fetched version" "FETCHED_VERSION" "$lib"
 
     if bash -n "$ADDON/run.sh" 2>/dev/null; then
         pass "generated run.sh passes bash -n"
