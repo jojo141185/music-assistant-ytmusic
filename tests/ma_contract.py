@@ -83,6 +83,40 @@ REQUIRED_MEDIA_TYPE_MEMBERS: tuple[str, ...] = (
     "PODCAST_EPISODE",
 )
 
+# ``ProviderFeature`` members the provider names. Unlike everything else in this
+# table, these are consumed at *import* time: ``BASE_FEATURES`` and
+# ``AUTHENTICATED_FEATURES`` are built from attribute access while the module
+# loads, so a member renamed or dropped upstream is not one degraded feature, it
+# is an AttributeError that stops ytmusic_free loading at all. Upstream has
+# deleted a member with no deprecation window before (``AUDIO_OVERLAY``, added
+# and gone again inside 63 days, on a pull request titled for something else),
+# so this is a live risk rather than a theoretical one.
+#
+# Pinned by member *name* on purpose. The enum defines ``_missing_`` and answers
+# UNKNOWN for anything it does not recognise, so a check written as a lookup by
+# value would stay green forever after a deletion.
+#
+# This is the one tuple here that describes us rather than upstream, so it is
+# also the one that can go stale on its own. ``tests/python/`` keeps it honest:
+# it is the only suite that can import the provider, and it asserts this tuple
+# against the two sets. See issue #65.
+REQUIRED_PROVIDER_FEATURE_MEMBERS: tuple[str, ...] = (
+    "SEARCH",
+    "ARTIST_ALBUMS",
+    "ARTIST_TOPTRACKS",
+    "SIMILAR_TRACKS",
+    "BROWSE",
+    "LIBRARY_ARTISTS",
+    "LIBRARY_ALBUMS",
+    "LIBRARY_TRACKS",
+    "LIBRARY_PLAYLISTS",
+    "RECOMMENDATIONS",
+    "LIBRARY_ARTISTS_EDIT",
+    "LIBRARY_ALBUMS_EDIT",
+    "LIBRARY_PLAYLISTS_EDIT",
+    "LIBRARY_PODCASTS",
+)
+
 # ``ItemMapping`` fields the provider sets. ``year`` is the one that matters:
 # the album-year feature in issue #53 exists only because upstream carries it,
 # and if it ever disappears the provider would be assigning to nothing.

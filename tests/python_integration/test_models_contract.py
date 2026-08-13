@@ -91,6 +91,39 @@ def test_media_type_has_the_members_the_provider_uses(real_models):
     assert not missing, f"upstream MediaType lost members the provider uses: {missing}"
 
 
+def test_provider_feature_has_the_members_the_provider_declares(real_models):
+    """The one contract failure here that would take the whole provider down.
+
+    ``BASE_FEATURES`` and ``AUTHENTICATED_FEATURES`` resolve these at module
+    scope, so a member dropped upstream is an AttributeError raised before the
+    provider class is even defined: no degraded feature, no provider.
+
+    ``hasattr`` on the name rather than a lookup by value, because
+    ``ProviderFeature._missing_`` answers UNKNOWN for anything it does not
+    recognise and a value-based check could never fail. See issue #65.
+    """
+    provider_feature = real_models.enums.ProviderFeature
+    missing = [
+        name
+        for name in ma_contract.REQUIRED_PROVIDER_FEATURE_MEMBERS
+        if not hasattr(provider_feature, name)
+    ]
+    assert not missing, (
+        f"upstream ProviderFeature lost members the provider declares: {missing}; "
+        "importing ytmusic_free would now raise AttributeError at module scope"
+    )
+
+
+# Deliberately not asserted here: that each of those members still carries the
+# same ``value`` string. ``UNKNOWN_VALUE`` is pinned because "?" is surprising
+# enough that a stub author writing from memory gets it wrong, which is what
+# issue #41 was. ProviderFeature has no such trap; every member the provider
+# names is mechanically ``name.lower()``. And the provider never reads a
+# feature's value: it puts members in a set and hands the set to the
+# constructor, so a re-valuing upstream cannot change what it does. Pinning them
+# would report somebody else's refactor as our failure.
+
+
 def test_item_mapping_exposes_the_fields_the_provider_sets(real_models):
     """``year`` in particular: the album-year feature depends on it existing.
 
