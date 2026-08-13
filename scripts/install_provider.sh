@@ -287,8 +287,9 @@ for _candidate in "$TMPDIR"/*/; do
         break
     fi
 done
-[ -n "$SRC_ROOT" ] && [ -d "$SRC_ROOT/$PROVIDER_DIR" ] \
-    || die "$PROVIDER_DIR/ not found in the archive downloaded from $TARBALL_URL"
+if [ -z "$SRC_ROOT" ] || [ ! -d "$SRC_ROOT/$PROVIDER_DIR" ]; then
+    die "$PROVIDER_DIR/ not found in the archive downloaded from $TARBALL_URL"
+fi
 
 # --- Stage to /config -------------------------------------------------------
 

@@ -297,8 +297,9 @@ for _candidate in "$TMPDIR"/*/; do
         break
     fi
 done
-[ -n "$SRC_ROOT" ] && [ -d "$SRC_ROOT/ytmusic_free" ] \
-    || die "ytmusic_free/ not found in the archive downloaded from $TARBALL_URL"
+if [ -z "$SRC_ROOT" ] || [ ! -d "$SRC_ROOT/ytmusic_free" ]; then
+    die "ytmusic_free/ not found in the archive downloaded from $TARBALL_URL"
+fi
 
 # The number a bug report needs. The add-on carries its own version line (see
 # ADDON_VERSION_LINE above), so this is surfaced in the description instead.
@@ -473,7 +474,9 @@ fetch_latest() {
     FETCHED_VERSION="$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' \
         "$CACHE/__init__.py" 2>/dev/null | head -n1)"
     [ -n "$FETCHED_VERSION" ] || FETCHED_VERSION="unknown"
-    echo "auto-update: cached provider $FETCHED_VERSION from $REF ($nh)"
+    # ${REF:-} because run.sh defines REF but this library is also sourced on
+    # its own by the test suite, which runs under set -u.
+    echo "auto-update: cached provider $FETCHED_VERSION from ${REF:-the configured ref} ($nh)"
     rm -rf "$tmp"; return 0
 }
 LIBEOF
