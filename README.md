@@ -178,7 +178,7 @@ The watcher can also **keep the provider up to date automatically**. Enable the 
 
 See **[WATCHER_ADDON.md](WATCHER_ADDON.md)** for the manual procedure, troubleshooting, and the available installer flags.
 
-> **If the automatic installer doesn't work on your system,** the [`v0.1.0-beta.1` pre-release](https://github.com/sproft/music-assistant-ytmusic/releases/tag/v0.1.0-beta.1) is a known-good checkpoint of the manual install path. Pin to it (the manual procedure in `WATCHER_ADDON.md` from that tag was the only documented option at the time and works on HAOS and Supervised installs) and please [open an issue](https://github.com/sproft/music-assistant-ytmusic/issues/new) so the installer can be fixed.
+> **If the automatic installer doesn't work on your system,** follow the manual procedure in **[WATCHER_ADDON.md](WATCHER_ADDON.md)**, which covers HAOS and Supervised installs, and please [open an issue](https://github.com/sproft/music-assistant-ytmusic/issues/new) so the installer can be fixed. Work from the [latest release](https://github.com/sproft/music-assistant-ytmusic/releases/latest) rather than an older tag: `v0.1.0-beta.1` is still published for anyone already pinned to it, but it is from May 2026 and predates podcast support, the AI-music filter, the fix for `403 Forbidden` playback failures, and the guard that stops an expired cookie from emptying your library.
 
 ---
 
