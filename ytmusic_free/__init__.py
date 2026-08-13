@@ -2272,26 +2272,86 @@ class YoutubeMusicFreeProvider(MusicProvider):
         else:
             self.logger.warning("%s failed: %s", context, err)
 
+    async def _fetch_library(self, method: str, **kwargs: Any) -> list[dict]:
+        """Run one ytmusicapi library call, failing the sync if it cannot answer.
+
+        Music Assistant treats a completed sync as authoritative: anything it
+        held for this provider and did not see this round is dropped from the
+        library, and whatever is then left with no provider claiming it is
+        unfavourited. So the "log it and return nothing" this replaces was not
+        a neutral "no data". It was an instruction to delete, issued on the
+        strength of a rate limit, a timeout or a stray parse error. Issue #64,
+        the same thesis as #55.
+
+        One helper rather than five copies. The swallow it replaces was written
+        once and then copied into each library method as it was added, most
+        recently into ``get_library_podcasts``. There is now one place to get
+        this wrong instead of five.
+
+        The original exception is re-raised unchanged rather than wrapped. Its
+        type and message are what a bug report needs, and ``_warn_library_error``
+        has already logged the explanation next to it.
+
+        ``except Exception`` is deliberate and must not be widened to
+        ``BaseException``: Music Assistant cancels the sync task on shutdown,
+        and a ``CancelledError`` is not a library failure to be logged as one.
+        """
+        try:
+            if self._ytmusic is None:
+                raise RuntimeError(
+                    "the ytmusicapi client is not initialised, so the library "
+                    "cannot be read"
+                )
+            call = getattr(self._ytmusic, method, None)
+            if call is None:
+                raise RuntimeError(
+                    f"the installed ytmusicapi has no {method}(). Upgrade it "
+                    "inside the Music Assistant container with "
+                    "`pip install --upgrade ytmusicapi`, then restart Music "
+                    "Assistant: the old module is already loaded in the "
+                    "running process, so the upgrade on its own changes "
+                    "nothing"
+                )
+            results = await asyncio.to_thread(call, **kwargs)
+            if results is None:
+                return []
+            if not isinstance(results, (list, tuple)):
+                # A shape we cannot count is a shape we cannot vouch for. len()
+                # of a dict counts its keys, so a changed response would sail
+                # past the empty-library guard on a non-zero count and then
+                # yield nothing, which is the deletion this helper exists to
+                # prevent.
+                raise TypeError(f"{method} returned {type(results).__name__}, expected a list")
+        except Exception as err:
+            # Warned here rather than at the call sites so the message still
+            # names the ytmusicapi method that actually failed.
+            self._warn_library_error(method, err)
+            raise
+        return list(results)
+
     async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
-        """Get artists from the user's library (subscriptions + library artists)."""
+        """Get artists from the user's library (subscriptions + library artists).
+
+        Two independent fetches, and a failure in either fails the whole method.
+        Each used to be swallowed on its own, after which the empty-library
+        guard ran on ``len(subs) + len(lib_artists)``: a failed subscriptions
+        call next to five library artists produced a non-zero count, a clean
+        sync, and the deletion of every subscribed artist. That sum only means
+        something when both halves actually answered. Issue #64.
+
+        The second fetch is skipped once the first has failed. Whatever took out
+        one call (a lapsed cookie, a rate limit, YouTube being down) is about to
+        take out the other, its result would be discarded by the raise anyway,
+        and retrying into a rate limit is how a short one becomes a long one.
+        """
 
         if not self._authenticated:
             await self._require_library_auth("artists")
             return
-        subs: list[dict] = []
-        lib_artists: list[dict] = []
-        try:
-            subs = await asyncio.to_thread(
-                self._ytmusic.get_library_subscriptions, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_subscriptions", err)
-        try:
-            lib_artists = await asyncio.to_thread(
-                self._ytmusic.get_library_artists, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_artists", err)
+        subs = await self._fetch_library("get_library_subscriptions", limit=9999)
+        lib_artists = await self._fetch_library("get_library_artists", limit=9999)
+        # Reached only when both fetches answered, which is the only reading of
+        # this sum that means anything.
         await self._guard_partial_auth_empty("artists", len(subs) + len(lib_artists))
         seen_ids: set[str] = set()
         for item in subs:
@@ -2317,13 +2377,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if not self._authenticated:
             await self._require_library_auth("albums")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_albums, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_albums", err)
-            return
+        results = await self._fetch_library("get_library_albums", limit=9999)
         await self._guard_partial_auth_empty("albums", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
@@ -2335,13 +2389,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if not self._authenticated:
             await self._require_library_auth("tracks")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_songs, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_songs", err)
-            return
+        results = await self._fetch_library("get_library_songs", limit=9999)
         await self._guard_partial_auth_empty("tracks", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
@@ -2355,13 +2403,7 @@ class YoutubeMusicFreeProvider(MusicProvider):
         if not self._authenticated:
             await self._require_library_auth("playlists")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_playlists, limit=9999
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_playlists", err)
-            return
+        results = await self._fetch_library("get_library_playlists", limit=9999)
         await self._guard_partial_auth_empty("playlists", len(results))
         for item in results:
             with suppress(InvalidDataError, KeyError, TypeError):
@@ -2373,19 +2415,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
         Same guard order as every other library method, and for the same reason:
         Music Assistant deletes anything a completed sync did not return, so an
-        unauthenticated run has to fail rather than answer "no subscriptions".
-        See issue #55.
+        unauthenticated run has to fail rather than answer "no subscriptions",
+        and so does a run whose fetch failed. See issues #55 and #64.
         """
         if not self._authenticated:
             await self._require_library_auth("podcasts")
             return
-        try:
-            results = await asyncio.to_thread(
-                self._ytmusic.get_library_podcasts, limit=LIBRARY_PODCAST_LIMIT
-            ) or []
-        except Exception as err:
-            self._warn_library_error("get_library_podcasts", err)
-            return
+        results = await self._fetch_library("get_library_podcasts", limit=LIBRARY_PODCAST_LIMIT)
         shows = [
             obj
             for obj in results

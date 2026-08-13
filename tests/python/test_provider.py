@@ -3563,6 +3563,11 @@ def test_library_error_warning_uses_generic_message_for_non_auth_errors(provider
 
 
 def test_get_library_playlists_propagates_auth_lapse_hint(provider):
+    """The hint is logged, and the sync fails rather than reporting no playlists.
+
+    It used to return an empty list here, which Music Assistant reads as an
+    instruction to delete every playlist it holds for this provider (#64).
+    """
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -3572,15 +3577,15 @@ def test_get_library_playlists_propagates_auth_lapse_hint(provider):
     )
     provider._ytmusic = mock
 
-    async def _consume():
-        return [item async for item in provider.get_library_playlists()]
+    with pytest.raises(RuntimeError, match="Unauthorized"):
+        _consume(provider.get_library_playlists())
 
-    assert asyncio.run(_consume()) == []
     joined = " ".join(handler.messages())
     assert "cookie" in joined.lower()
 
 
 def test_get_library_albums_propagates_auth_lapse_hint(provider):
+    """As above, for albums: the hint survives and the sync still fails."""
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -3590,10 +3595,9 @@ def test_get_library_albums_propagates_auth_lapse_hint(provider):
     )
     provider._ytmusic = mock
 
-    async def _consume():
-        return [item async for item in provider.get_library_albums()]
+    with pytest.raises(RuntimeError, match="Unauthorized"):
+        _consume(provider.get_library_albums())
 
-    assert asyncio.run(_consume()) == []
     joined = " ".join(handler.messages())
     assert "cookie" in joined.lower()
 
@@ -3891,6 +3895,7 @@ def _cookie_configured(provider, auth_type=None):
         ("get_library_albums", "albums"),
         ("get_library_artists", "artists"),
         ("get_library_playlists", "playlists"),
+        ("get_library_podcasts", "podcasts"),
     ],
 )
 def test_unauthenticated_library_sync_fails_instead_of_reporting_empty(
@@ -3964,3 +3969,302 @@ def test_guard_checks_every_empty_category_regardless_of_history(provider):
     with pytest.raises(RuntimeError, match="cookie lapse"):
         _consume(provider.get_library_playlists())
     assert mock.get_account_info.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# A failed library fetch fails the sync (issue #64)
+#
+# The #55 work closed two of the three routes to a completed-but-empty sync:
+# an unauthenticated run, and an empty result the session probe blames on a
+# lapsed cookie. The third stayed open. When the fetch itself raised, the
+# generator logged and returned, which is a *successful* sync of zero items,
+# and Music Assistant deletes everything a successful sync did not return.
+# A rate limit therefore emptied the library exactly the way an expired cookie
+# used to.
+# ---------------------------------------------------------------------------
+
+
+def _consume_until_error(generator):
+    """Drain a generator, returning (items yielded, error raised or None).
+
+    Needed because the point of several tests below is that *nothing* is
+    yielded before the raise: pytest.raises alone cannot tell "raised without
+    yielding" apart from "yielded half a library and then raised".
+    """
+    collected = []
+
+    async def _drain():
+        try:
+            async for item in generator:
+                collected.append(item)
+        except Exception as err:  # noqa: BLE001 - the error is the assertion
+            return err
+        return None
+
+    return collected, asyncio.run(_drain())
+
+
+# (provider method, the ytmusicapi method it fetches through)
+_LIBRARY_FETCHES = [
+    ("get_library_tracks", "get_library_songs"),
+    ("get_library_albums", "get_library_albums"),
+    ("get_library_playlists", "get_library_playlists"),
+    ("get_library_podcasts", "get_library_podcasts"),
+    ("get_library_artists", "get_library_subscriptions"),
+]
+
+
+@pytest.mark.parametrize(("method", "client_method"), _LIBRARY_FETCHES)
+def test_a_failed_library_fetch_fails_the_sync_instead_of_reporting_empty(
+    provider, method, client_method
+):
+    """Every library category, one rule: a fetch we could not complete raises."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    setattr(
+        mock,
+        client_method,
+        MagicMock(side_effect=RuntimeError("Server returned HTTP 503: Service Unavailable")),
+    )
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="503"):
+        _consume(getattr(provider, method)())
+
+
+@pytest.mark.parametrize(("method", "client_method"), _LIBRARY_FETCHES)
+def test_a_failed_library_fetch_yields_nothing_before_it_raises(
+    provider, method, client_method
+):
+    """Fail before the first yield, not halfway through.
+
+    Music Assistant commits each item as it arrives, so a half-drained sync
+    leaves writes behind for items it is about to disown. Fetching everything
+    up front and raising before the loop keeps that from happening.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    setattr(mock, client_method, MagicMock(side_effect=RuntimeError("boom")))
+    provider._ytmusic = mock
+
+    items, err = _consume_until_error(getattr(provider, method)())
+
+    assert items == []
+    assert isinstance(err, RuntimeError)
+
+
+def test_a_failed_library_fetch_logs_the_underlying_error_before_raising(provider):
+    """Raising must not cost the diagnostic that says what actually broke."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(side_effect=RuntimeError("Connection timeout"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError, match="Connection timeout"):
+        _consume(provider.get_library_tracks())
+
+    joined = " ".join(handler.messages())
+    assert "get_library_songs" in joined
+    assert "Connection timeout" in joined
+    # Not an auth error, so it must not be reported as an expired cookie.
+    assert "cookie" not in joined.lower()
+    assert provider._auth_lapse_warned is False
+
+
+def test_a_failed_library_fetch_does_not_probe_the_session(provider):
+    """A failed fetch is not an empty library, so the cookie is not the suspect.
+
+    The probe exists to explain an empty result. Running it here would spend a
+    request and could pin a network failure on the user's cookie.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_albums())
+
+    assert mock.get_account_info.call_count == 0
+
+
+def test_a_failed_library_fetch_does_not_mark_the_category_as_populated(provider):
+    """A library we failed to read tells us nothing about whether it has items."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    provider._library_seen_nonempty = {}
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_albums())
+
+    assert provider._library_seen_nonempty == {}
+
+
+def test_get_library_artists_fails_when_the_subscriptions_fetch_fails(provider):
+    """Half a result is not a library.
+
+    Artists come from two calls. The empty-library guard used to run on their
+    combined length, so a failed subscriptions call sitting next to one
+    successful library artist produced a non-zero count, a clean sync, and the
+    deletion of every subscribed artist.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 429: Too Many Requests")
+    )
+    mock.get_library_artists = MagicMock(
+        return_value=[{"browseId": "UC1", "artist": "Still Here"}]
+    )
+    provider._ytmusic = mock
+
+    items, err = _consume_until_error(provider.get_library_artists())
+
+    assert items == []
+    assert isinstance(err, RuntimeError)
+    assert "429" in str(err)
+
+
+def test_get_library_artists_fails_when_the_library_artists_fetch_fails(provider):
+    """The mirror case, so neither half of the artist sync is privileged."""
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(
+        return_value=[{"browseId": "UC1", "artist": "Still Here"}]
+    )
+    mock.get_library_artists = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 500: Internal Server Error")
+    )
+    provider._ytmusic = mock
+
+    items, err = _consume_until_error(provider.get_library_artists())
+
+    assert items == []
+    assert isinstance(err, RuntimeError)
+    assert "500" in str(err)
+
+
+def test_get_library_artists_skips_the_second_fetch_once_the_first_has_failed(provider):
+    """Whatever took out one call is about to take out the other.
+
+    Its result would be discarded by the raise anyway, and retrying into a rate
+    limit is how a short one becomes a long one.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_subscriptions = MagicMock(side_effect=RuntimeError("boom"))
+    mock.get_library_artists = MagicMock(return_value=[])
+    provider._ytmusic = mock
+
+    with pytest.raises(RuntimeError):
+        _consume(provider.get_library_artists())
+
+    assert mock.get_library_artists.call_count == 0
+
+
+def test_a_missing_ytmusicapi_library_method_fails_with_an_upgrade_hint(provider):
+    """An ytmusicapi too old for podcasts must not read as "no subscriptions".
+
+    The provider asks pip for `ytmusicapi` with no version, so an install that
+    already had an older copy keeps it and never reaches the manifest floor.
+
+    The hint has to name the restart as well as the upgrade. The module is
+    resolved through ``importlib.import_module``, which hands back whatever is
+    already in ``sys.modules``, so an in-place pip upgrade is invisible to the
+    running process and a provider reload does not replace it either. A hint
+    that stops at "upgrade" sends the user round the loop a second time.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    provider._ytmusic = MagicMock(spec=["get_library_songs"])
+
+    with pytest.raises(RuntimeError, match="ytmusicapi"):
+        _consume(provider.get_library_podcasts())
+
+    joined = " ".join(handler.messages()).lower()
+    assert "upgrade" in joined
+    assert "restart" in joined
+
+
+def test_a_library_fetch_of_an_unexpected_shape_fails_rather_than_being_counted(provider):
+    """A shape we cannot count is a shape we cannot vouch for.
+
+    len() of a dict counts its keys, so a changed response would clear the
+    empty-library guard on a non-zero count and then yield nothing, which is
+    precisely the deletion this all exists to prevent.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(return_value={"contents": [], "continuation": "x"})
+    provider._ytmusic = mock
+
+    with pytest.raises(TypeError, match="expected a list"):
+        _consume(provider.get_library_albums())
+
+
+def test_a_library_fetch_returning_none_is_still_an_empty_library(provider):
+    """None is how ytmusicapi spells "nothing here", not a failure.
+
+    Regression guard for the `or []` that moved into the fetch helper: an
+    account with no saved albums must still sync cleanly rather than raise.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_albums = MagicMock(return_value=None)
+    mock.get_account_info = MagicMock(return_value={"accountName": "Someone"})
+    provider._ytmusic = mock
+
+    assert _consume(provider.get_library_albums()) == []
+
+
+def test_a_cancelled_library_sync_is_not_logged_as_a_library_failure(provider):
+    """Shutdown is not a library failure.
+
+    Music Assistant cancels the sync task when it stops. CancelledError is a
+    BaseException, so `except Exception` in the fetch helper lets it through
+    untouched. This pins that: widening the catch would fill the log with
+    library errors on every restart and would swallow the cancellation.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    handler = _attach_capture(provider)
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(side_effect=asyncio.CancelledError())
+    provider._ytmusic = mock
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(provider._fetch_library("get_library_songs", limit=1))
+
+    assert handler.messages() == []
+
+
+def test_one_unparseable_library_item_does_not_fail_the_whole_sync(provider):
+    """Per-item tolerance is deliberate and must survive this change.
+
+    The fix is about a fetch that could not answer. An item the parser cannot
+    read is a different thing: the rest of the library is still good, and
+    failing the sync over one bad row would be the more destructive choice.
+    """
+    provider._authenticated = True
+    provider._auth_lapse_warned = False
+    mock = MagicMock()
+    mock.get_library_songs = MagicMock(return_value=[_track_dict("v1"), {"title": "no id"}])
+    provider._ytmusic = mock
+
+    tracks = _consume(provider.get_library_tracks())
+
+    assert [t.item_id for t in tracks] == ["v1"]
