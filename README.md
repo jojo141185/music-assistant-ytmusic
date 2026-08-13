@@ -29,6 +29,14 @@ The Music Assistant maintainers have stated more than once that they do not want
 
 Keeping these reports here respects the Music Assistant team's wishes and keeps them out of a project they have asked not to be involved with.
 
+**Please include the version.** The provider logs it on every start, as the first line it writes:
+
+```
+YouTube Music (Free) provider version 1.0.0
+```
+
+Search the Music Assistant log for `provider version` to find it. Without that line a report can only be answered with guesses about which build you have.
+
 ---
 
 ## Installation: Standalone Docker Compose

@@ -76,3 +76,69 @@ def test_manifest_declares_multi_instance(manifest):
     # ProviderManifest, and the string "true" would be just as truthy in a test
     # while meaning nothing to the config flow. See issue #40.
     assert manifest["multi_instance"] is True
+
+
+# ---------------------------------------------------------------------------
+# Versioning (issue #68)
+# ---------------------------------------------------------------------------
+
+
+def test_version_is_semver():
+    """The release workflow compares the tag to this string, so it must parse.
+
+    A tag is rejected unless it is exactly "v" + this value, which is what stops
+    a release and the code inside it claiming different numbers.
+    """
+    import re
+
+    import ytmusic_free as ytm
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", ytm.__version__), (
+        f"__version__ must be semver, got {ytm.__version__!r}"
+    )
+
+
+def test_manifest_declares_no_version_key(manifest):
+    """One source of truth, and the manifest is not it.
+
+    ProviderManifest has no version field and mashumaro drops unknown keys, so a
+    copy here would be invisible to Music Assistant while still being free to
+    drift away from ytmusic_free.__version__.
+    """
+    assert "version" not in manifest
+
+
+def test_manifest_stage_is_a_known_provider_stage(manifest):
+    """Mirrors music_assistant_models.enums.ProviderStage.
+
+    A typo parses fine as JSON and then fails inside Music Assistant at load
+    time, which is a long way from here.
+    """
+    assert manifest["stage"] in {
+        "alpha",
+        "beta",
+        "stable",
+        "experimental",
+        "unmaintained",
+        "deprecated",
+    }
+
+
+def test_the_release_helper_reads_the_same_version():
+    """The workflow gate must agree with the module it is gating.
+
+    read_version.py parses the AST instead of importing, because ytmusic_free
+    imports the music_assistant server package at module scope and that is not
+    installed in a plain CI job. This pins the two readings together, so moving
+    or reformatting __version__ cannot silently break the release gate.
+    """
+    import subprocess
+    import sys
+
+    import ytmusic_free as ytm
+
+    helper = MANIFEST_PATH.parents[1] / ".github" / "scripts" / "read_version.py"
+    result = subprocess.run(
+        [sys.executable, str(helper)], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == ytm.__version__
