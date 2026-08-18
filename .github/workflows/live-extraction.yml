@@ -16,9 +16,17 @@ name: live-extraction
 # The scheduled run does fail loudly, though. A canary that always concludes
 # green sends no notification, and its step summary is only seen by someone who
 # already went looking, which defeats the point of having one. Because it never
-# runs on a pull request, a red run here blocks nothing. To keep the signal
-# trustworthy the check is retried once before the job gives up, which absorbs
-# the transient blocks without hiding a real breakage.
+# runs on a pull request, a red run here blocks nothing. The check is retried
+# once before the job gives up, which absorbs a transient rate limit.
+#
+# The retry does not rule out an address block: it runs on the same runner after
+# 60s, so a bot check keyed to the IP is refused identically both times. That is
+# why the podcast episode check skips on a bot check rather than failing. It was
+# red for five nights running on that alone (2026-08-13 to 2026-08-17) while the
+# music checks passed beside it, and a canary nobody believes is worse than no
+# canary. The music checks still fail on a bot check, deliberately, because
+# tracks are refused far less readily than long-form video and losing those is
+# worth waking someone for.
 
 on:
   schedule:
@@ -80,6 +88,21 @@ jobs:
               echo
               echo "yt-dlp resolved an audio-only stream above the bitrate floor,"
               echo "and the resolved url served real bytes when fetched immediately."
+              # Surfaced on the green path on purpose. A check that skipped
+              # verified nothing, and without this the summary claims a coverage
+              # the run did not have.
+              if grep -q '^SKIPPED' live.log 2>/dev/null; then
+                echo
+                echo "Some checks skipped, so they verified nothing this run:"
+                echo
+                echo '```'
+                grep '^SKIPPED' live.log
+                echo '```'
+                echo
+                echo "A skipped podcast episode check means this runner's address"
+                echo "was refused by YouTube's bot check. The music checks above"
+                echo "did pass, so anonymous playback itself is healthy."
+              fi
             else
               echo "## Anonymous extraction or playback FAILED"
               echo
@@ -93,11 +116,18 @@ jobs:
               echo "  failing test name — if it is the fetch or the available_at check,"
               echo "  the problem is playback rather than extraction."
               echo
-              echo "This already retried once, so a one-off block has been ruled out."
-              echo "A blocked runner IP remains the most likely cause and says nothing"
-              echo "about the provider, so re-run the job before changing any code. If it"
-              echo "keeps failing, check yt-dlp's issue tracker next, and only then treat"
-              echo "it as a provider problem."
+              echo "This already retried once, which rules out a transient rate limit."
+              echo "It does NOT rule out an address block: the retry runs on the same"
+              echo "runner, so a bot check keyed to the IP is refused both times. A"
+              echo "blocked runner address says nothing about the provider, so re-run"
+              echo "the job before changing any code. If it keeps failing, check"
+              echo "yt-dlp's issue tracker next, and only then treat it as a provider"
+              echo "problem."
+              echo
+              echo "A bot check on the music checks is what you are looking at if the"
+              echo "failing test names mention extraction. The podcast episode check"
+              echo "skips on a bot check instead of failing, so it is not the cause of"
+              echo "a red run here."
               echo
               echo '<details><summary>pytest output</summary>'
               echo

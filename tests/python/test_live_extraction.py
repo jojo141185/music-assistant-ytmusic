@@ -55,6 +55,22 @@ MIN_ACCEPTABLE_BITRATE = 96
 PROBE_BYTES = 1024
 
 
+def _is_bot_check(err: BaseException) -> bool:
+    """True when ``err`` is YouTube refusing an anonymous client as a suspected bot.
+
+    Matched on "not a bot" rather than the full sentence. The message wraps a
+    video id and two wiki urls that change between releases, and its apostrophe
+    is a unicode right single quote, so matching on "you're" fails depending on
+    how the text was copied.
+
+    Narrow on purpose, to exclude "Sign in to confirm your age". That shares the
+    opening words and means something entirely different: age-gating belongs to
+    the content and reproduces from any IP, so it has to keep failing loudly
+    rather than skip.
+    """
+    return "not a bot" in str(err)
+
+
 def _fetch_range(url: str) -> tuple[int, bytes]:
     """Fetch the first bytes of ``url``. Returns (status, body).
 
@@ -86,6 +102,19 @@ def _resolve_first_available(provider, *, prefer_quality=True):
         if fmt:
             return video_id, fmt
         failures.append(f"{video_id}: selector returned no format")
+
+    # A bot check here is reported rather than skipped, unlike the podcast
+    # episode check further down. Music tracks are the provider's core function
+    # and are refused far less readily than long-form video, so YouTube turning
+    # one away is worth a human look even when the address is the reason.
+    if any("not a bot" in failure for failure in failures):
+        pytest.fail(
+            "YouTube answered anonymous extraction with its bot check for every "
+            "known video. On a datacenter address that can mean the runner "
+            "rather than the provider, so re-run before changing code; if it "
+            "persists, anonymous playback is genuinely gated and users are "
+            "affected:\n  " + "\n  ".join(failures)
+        )
 
     pytest.fail(
         "anonymous extraction failed for every known video, which usually means "
@@ -248,7 +277,27 @@ def test_podcasts_still_resolve_anonymously(provider):
 
 
 def test_live_podcast_episode_is_playable(provider):
-    """An episode is an ordinary video id, so the track stream path must carry it."""
+    """An episode is an ordinary video id, so the track stream path must carry it.
+
+    Skips rather than fails when YouTube answers with its bot check, because
+    that is a property of where the test runs and not of this provider. An
+    episode is a regular long-form video, and YouTube applies the check to those
+    far more aggressively than to YouTube Music tracks: on a datacenter IP the
+    music checks above pass in the same run that this one is refused. Verified
+    from a residential connection on 2026-08-17, where the whole live suite
+    including this test passes against the same episode CI was refused.
+
+    Failing on it cost the canary five consecutive nights (2026-08-13 to
+    2026-08-17, every run since podcast support landed), which is how a check
+    stops being read at all.
+
+    This does not blind the canary to a real gating change. If YouTube ever
+    demands an account for anonymous playback generally, the music tests above
+    fail on the same bot check and the run still goes red. What is given up here
+    is only the case where podcast episodes alone become account-only in a way
+    that reproduces from every IP, and that would arrive as a user report about
+    a feature that demonstrably works today.
+    """
     ytmusicapi = pytest.importorskip("ytmusicapi", reason="needed to reach the podcast endpoints")
     provider._ytmusic = ytmusicapi.YTMusic()
     provider._yt_dlp_module = None
@@ -269,9 +318,22 @@ def test_live_podcast_episode_is_playable(provider):
     asyncio.run(_first_episode())
     assert episode is not None
 
-    details = asyncio.run(
-        provider.get_stream_details(episode.item_id, MediaType.PODCAST_EPISODE)
-    )
+    try:
+        details = asyncio.run(
+            provider.get_stream_details(episode.item_id, MediaType.PODCAST_EPISODE)
+        )
+    except Exception as err:  # noqa: BLE001 - narrowed by _is_bot_check below
+        if not _is_bot_check(err):
+            raise
+        pytest.skip(
+            f"{episode.item_id}: YouTube answered the episode with its bot "
+            "check, so this runner's IP cannot reach episode playback "
+            "anonymously. The music checks in this file cover whether "
+            "anonymous playback works at all, and they are not skipped; if "
+            "they passed in this run, extraction is healthy and this is the "
+            "runner's address rather than the provider."
+        )
+
     assert details.item_id == episode.item_id, (
         "StreamDetails must echo the id Music Assistant asked for, or it cannot "
         "match the stream back to the queue item"
