@@ -65,9 +65,12 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
+          # -rs is load-bearing: the summary step greps live.log for lines
+          # starting with SKIPPED, and only the -rs short summary puts them at
+          # column 0. Plain -v renders skips mid-line, which that grep misses.
           for attempt in 1 2; do
             echo "::group::attempt $attempt"
-            if python -m pytest tests/python -m live -v 2>&1 | tee live.log; then
+            if python -m pytest tests/python -m live -v -rs 2>&1 | tee live.log; then
               echo "::endgroup::"
               exit 0
             fi
