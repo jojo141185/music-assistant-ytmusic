@@ -1672,11 +1672,16 @@ class _FakeGoogleVideo:
         ignore_range: bool = False,
         send_content_range: bool = True,
         truncate_first: int | None = None,
+        max_range: int | None = None,
     ):
         self.blob = blob
         self.ignore_range = ignore_range
         self.send_content_range = send_content_range
         self.truncate_first = truncate_first
+        # The size cap: ranges asking for more than this many bytes answer
+        # 403, the way googlevideo does since 2026-08 (1 MiB passed, 2 MiB
+        # did not, measured against a real ANDROID_VR URL).
+        self.max_range = max_range
         self.requests: list[tuple[str, dict]] = []
 
     def get(self, url, headers=None, **_kwargs):
@@ -1689,6 +1694,8 @@ class _FakeGoogleVideo:
             return _RangeResponse(403)
         start_s, end_s = rng[len("bytes=") :].split("-")
         start, end = int(start_s), int(end_s)
+        if self.max_range is not None and (end - start + 1) > self.max_range:
+            return _RangeResponse(403)
         if start >= len(self.blob):
             return _RangeResponse(416)
         chunk = self.blob[start : end + 1]
@@ -1852,6 +1859,45 @@ def test_get_audio_stream_resumes_a_truncated_chunk(provider, monkeypatch):
     assert [h["Range"] for _, h in session.requests][:2] == ["bytes=0-4", "bytes=3-7"]
 
 
+def test_get_audio_stream_halves_the_chunk_when_the_size_cap_moves(provider, monkeypatch):
+    """The cap has moved once already (10 MiB worked, then 403d).
+
+    A server that refuses the configured chunk size must degrade playback to
+    smaller requests, not kill it: the provider halves down to the floor and
+    retries the same position, so nothing is skipped and nothing repeats.
+    """
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 16)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    blob = bytes(range(24))
+    session = _FakeGoogleVideo(blob, max_range=5)  # 16 -> 8 -> 4 allowed
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    ranges = [h["Range"] for _, h in session.requests]
+    # Two refused probes, then 4-byte chunks all the way from position 0.
+    assert ranges[:3] == ["bytes=0-15", "bytes=0-7", "bytes=0-3"]
+    assert all(r.startswith("bytes=") for r in ranges)
+    assert len(ranges) == 2 + len(blob) // 4
+
+
+def test_get_audio_stream_gives_up_only_below_the_floor(provider, monkeypatch):
+    """A 403 that survives the floor is a dead URL, not a size problem."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 16)
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_FLOOR", 4)
+    session = _FakeGoogleVideo(bytes(24), max_range=2)  # even the floor 403s
+    provider.mass = _mass_with_session(session)
+
+    with pytest.raises(UnplayableMediaError):
+        _stream_all(provider, _custom_stream_details())
+    assert [h["Range"] for _, h in session.requests] == [
+        "bytes=0-15",
+        "bytes=0-7",
+        "bytes=0-3",
+    ]
+
+
 def test_content_range_total_parses_and_rejects():
     assert ytm._content_range_total("bytes 0-1023/16492447") == 16492447
     assert ytm._content_range_total("bytes 0-1023/*") is None
@@ -2008,6 +2054,58 @@ def test_get_stream_details_does_not_wait_without_a_preroll(provider, monkeypatc
 )
 def test_ytdlp_preroll_support_by_version(version, honours):
     assert ytm._ytdlp_honours_preroll(version) is honours
+
+
+@pytest.mark.parametrize(
+    ("version", "can_stream"),
+    [
+        # Everything at or below stable 2026.07.04 defaults to android_vr,
+        # whose URLs stop serving after ~1 MiB since 2026-08-17.
+        ("2026.07.04", False),
+        ("2025.12.08", False),
+        # The nightly that dropped android_vr from the defaults, and anything
+        # after it (nightlies carry a fourth timestamp segment).
+        ("2026.08.18.122307", True),
+        ("2026.08.18", True),
+        ("2026.09.01", True),
+        # Unreadable versions fail towards "fine": this check only gates a
+        # warning, and the 403 still surfaces on its own.
+        ("", True),
+        (None, True),
+        ("2026.08", True),
+        ("nightly", True),
+    ],
+)
+def test_ytdlp_streaming_support_by_version(version, can_stream):
+    assert ytm._ytdlp_can_stream(version) is can_stream
+
+
+def test_install_packages_requests_the_playback_floor(provider):
+    """A bare "yt-dlp[default]" is a no-op on every existing install.
+
+    pip does not upgrade an already-satisfied requirement, so the floor in
+    _install_packages is the only mechanism that moves existing installs off
+    the android_vr-era yt-dlp. See yt-dlp/yt-dlp#17461.
+    """
+    requested = []
+
+    async def _record(pkg):
+        requested.append(pkg)
+
+    original = ytm.install_package
+    ytm.install_package = _record
+    try:
+        asyncio.run(provider._install_packages())
+    finally:
+        ytm.install_package = original
+    assert requested[0] == ytm.MIN_YTDLP_REQUIREMENT
+    # The floor names a pre-release on purpose: PEP 440 only lets pip resolve
+    # pre-releases when the specifier itself contains one, and the fixed
+    # yt-dlp currently only exists as a nightly.
+    assert ">=" in ytm.MIN_YTDLP_REQUIREMENT
+    version_floor = ytm.MIN_YTDLP_REQUIREMENT.partition(">=")[2]
+    parsed_floor = tuple(int(p) for p in version_floor.split(".")[:3])
+    assert parsed_floor >= ytm.MIN_YTDLP_VERSION_FOR_PLAYBACK
 
 
 def _yt_dlp_stub_reporting(version):

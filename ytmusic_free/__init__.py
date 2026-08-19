@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import asyncio
 import importlib
@@ -94,8 +94,22 @@ DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
 # breaking every install at once with extraction still green). ffmpeg only ever
 # opens URLs the unbounded way, so the URL cannot be handed to Music Assistant
 # as StreamType.HTTP; the provider fetches the bytes itself in bounded chunks
-# instead. 10 MiB mirrors yt-dlp's own http_chunk_size for these clients.
-STREAM_CHUNK_SIZE = 10 * 1024 * 1024
+# instead.
+#
+# Bounded is not enough: the range's *size* is capped too. Measured on
+# 2026-08-19 against a real ANDROID_VR URL: 1 MiB answers 206 and 2 MiB
+# answers 403 (the earlier 10 MiB, chosen to mirror yt-dlp's http_chunk_size,
+# 403d in production while every diagnostic that probed with small ranges
+# passed). 1 MiB is the largest measured-good size; get_audio_stream also
+# halves the chunk on a 403 down to STREAM_CHUNK_FLOOR before failing, so a
+# future tightening of the cap degrades to smaller requests instead of
+# breaking playback outright.
+STREAM_CHUNK_SIZE = 1024 * 1024
+
+# Give-up point for that halving. Below this, request overhead dominates and a
+# 403 is clearly not about the range size anymore (1 KiB probes pass even when
+# 10 MiB fails), so keep shrinking would only mask a different failure.
+STREAM_CHUNK_FLOOR = 64 * 1024
 
 # How much of a chunk's body to hand over per yield. Purely a buffering knob
 # for the pipe into ffmpeg; it has no effect on the HTTP requests.
@@ -111,6 +125,27 @@ STREAM_YIELD_SIZE = 64 * 1024
 # know is still gated is the worst of both outcomes: the user gets the silence
 # and the failure. Failing at once at least skips to the next track promptly.
 MAX_PREROLL_WAIT = 45.0
+
+# The oldest yt-dlp that can still stream at all. YouTube killed the
+# android_vr client on 2026-08-17: its URLs serve at most ~1 MiB in total and
+# then answer 403 to every request, bounded or not, paced or not (all of it
+# measured 2026-08-19), so no fetch strategy on this side can play a full
+# track from them. yt-dlp dropped android_vr from its default clients in
+# nightly 2026.08.18 (yt-dlp/yt-dlp#17461); those defaults extract via
+# visionos, verified the same day to serve whole files with no PO token.
+#
+# The ``.dev0`` spelling is load-bearing twice over: it is the version PyPI
+# actually carries for the nightly, and PEP 440 only lets pip consider
+# pre-releases when the specifier itself names one, so this floor installs
+# nightlies without any --pre flag. Replace with the next stable release once
+# one exists above it.
+MIN_YTDLP_REQUIREMENT = "yt-dlp[default]>=2026.8.18.122307.dev0"
+
+# The same floor as a comparable date tuple, for warning at stream time when
+# the *imported* module is still older: install_package upgrades the package
+# on disk, but a Python process that already imported yt_dlp keeps the old
+# module until Music Assistant restarts.
+MIN_YTDLP_VERSION_FOR_PLAYBACK = (2026, 8, 18)
 
 # ``available_at`` first appeared in yt-dlp 2025.08.20, but it only became
 # ad-derived in 2025.12.08. On the releases in between it is a flat six seconds
@@ -716,6 +751,27 @@ def _ytdlp_honours_preroll(version: str | None) -> bool:
     return parsed >= MIN_YTDLP_VERSION_FOR_PREROLL
 
 
+def _ytdlp_can_stream(version: str | None) -> bool:
+    """Whether this yt-dlp's default clients survive the android_vr shutdown.
+
+    See ``MIN_YTDLP_VERSION_FOR_PLAYBACK``. Below the floor the defaults still
+    include android_vr, whose URLs stop serving after ~1 MiB, so every track
+    longer than a jingle dies mid-first-chunk. Only used to *warn*, never to
+    refuse: an unreadable version returns True because a wrong warning every
+    track is worse than a missing one, and the 403 itself still surfaces.
+    """
+    if not version:
+        return True
+    parts = version.split(".")[:3]
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except (TypeError, ValueError):
+        return True
+    if len(parsed) < 3:
+        return True
+    return parsed >= MIN_YTDLP_VERSION_FOR_PLAYBACK
+
+
 def _preroll_wait_seconds(fmt: dict[str, Any], now: float | None = None) -> float:
     """Seconds to wait before ``fmt``'s URL can actually be fetched.
 
@@ -908,6 +964,10 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # know to be wrong about it is detected: the guard exists to suppress one
     # bad release range, not to opt in to the fix. See issue #51.
     _preroll_supported: bool = True
+    # Once-per-load latch for the stale-yt-dlp warning: the condition holds
+    # for every single track until Music Assistant restarts, and one loud
+    # warning reads better than one per queue item.
+    _warned_stale_ytdlp: bool = False
     # AI-music filter (issue #53). Two sets rather than one, because channel
     # ids must match exactly while names have to survive spelling drift.
     _ai_filter_enabled: bool = False
@@ -2223,23 +2283,41 @@ class YoutubeMusicFreeProvider(MusicProvider):
         data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
         url = data.get("url") or streamdetails.path
         base_headers: dict[str, str] = dict(data.get("headers") or {})
+        chunk_size = STREAM_CHUNK_SIZE
         pos = 0
         total: int | None = None
         while total is None or pos < total:
-            end = pos + STREAM_CHUNK_SIZE - 1
+            end = pos + chunk_size - 1
             if total is not None:
                 end = min(end, total - 1)
             headers = {**base_headers, "Range": f"bytes={pos}-{end}"}
             received = 0
             async with self.mass.http_session.get(url, headers=headers) as response:
                 if response.status == 403:
+                    # googlevideo caps the range size and the cap has already
+                    # moved once (10 MiB worked, then didn't). Nothing has
+                    # been yielded for this request, so retrying the same
+                    # position with a smaller ask is safe; only when the floor
+                    # still 403s is the URL itself the problem.
+                    if chunk_size > STREAM_CHUNK_FLOOR:
+                        chunk_size = max(chunk_size // 2, STREAM_CHUNK_FLOOR)
+                        self.logger.debug(
+                            "403 for a %d-byte range on %s; retrying bytes %d- "
+                            "with %d-byte chunks",
+                            end - pos + 1,
+                            streamdetails.item_id,
+                            pos,
+                            chunk_size,
+                        )
+                        continue
                     # The strongest signal this provider has that the URL is
                     # dead (expired, or enforcement changed again). Name the
                     # position: a 403 at byte 0 and a 403 mid-track are
                     # different bugs.
                     raise UnplayableMediaError(
                         f"googlevideo answered 403 at bytes {pos}-{end} for "
-                        f"{streamdetails.item_id}"
+                        f"{streamdetails.item_id} even at the "
+                        f"{STREAM_CHUNK_FLOOR}-byte floor"
                     )
                 if response.status == 416:
                     # Asked past the end of the file: a Content-Range total
@@ -2837,9 +2915,25 @@ class YoutubeMusicFreeProvider(MusicProvider):
 
             # Decided here rather than at the call site because this is the only
             # place the module is guaranteed to be imported.
-            self._preroll_supported = _ytdlp_honours_preroll(
-                getattr(getattr(yt_dlp, "version", None), "__version__", None)
-            )
+            ytdlp_version = getattr(getattr(yt_dlp, "version", None), "__version__", None)
+            self._preroll_supported = _ytdlp_honours_preroll(ytdlp_version)
+
+            # Checked against the *imported* module, not the installed package:
+            # setup upgrades the package on disk, but a process that already
+            # imported the old yt_dlp keeps it until Music Assistant restarts,
+            # and that gap looks exactly like the outage the upgrade fixed.
+            if not self._warned_stale_ytdlp and not _ytdlp_can_stream(ytdlp_version):
+                self._warned_stale_ytdlp = True
+                self.logger.warning(
+                    "yt-dlp %s still extracts through the android_vr client, "
+                    "which YouTube shut down on 2026-08-17: its URLs stop "
+                    "serving after ~1 MiB, so every track dies mid-stream. "
+                    "The provider requests %s at startup; restart Music "
+                    "Assistant so the upgrade is picked up, or run "
+                    "pip install -U --pre 'yt-dlp[default]' in the container.",
+                    ytdlp_version,
+                    MIN_YTDLP_REQUIREMENT,
+                )
 
             url = f"{YTM_DOMAIN}/watch?v={video_id}"
             ydl_opts = {
@@ -3366,9 +3460,31 @@ class YoutubeMusicFreeProvider(MusicProvider):
         )
 
     async def _install_packages(self) -> None:
-        """Install required packages if not already present."""
-        for pkg in ("yt-dlp[default]", "ytmusicapi"):
-            await install_package(pkg)
+        """Install required packages, upgrading yt-dlp past the android_vr cutoff.
+
+        The yt-dlp requirement carries the MIN_YTDLP_REQUIREMENT floor rather
+        than a bare name, and that difference is what actually delivers the
+        2026-08 fix to existing installs: Music Assistant skips manifest
+        requirements without ``==``, and pip never touches an
+        already-satisfied bare requirement, so a floor here at setup is the
+        only hook that runs on every provider load.
+
+        An install failure degrades to a warning while something importable
+        exists: a stale yt-dlp plays nothing but browses fine, and the stream
+        path warns about staleness itself, whereas refusing to load would
+        take browsing down with it (and the import checks below still stop a
+        genuinely absent package).
+        """
+        for pkg in (MIN_YTDLP_REQUIREMENT, "ytmusicapi"):
+            try:
+                await install_package(pkg)
+            except Exception as err:  # noqa: BLE001 - degrade to what's installed
+                self.logger.warning(
+                    "could not install or upgrade %s: %s. Continuing with "
+                    "whatever is already installed.",
+                    pkg,
+                    err,
+                )
         try:
             await asyncio.to_thread(importlib.import_module, "yt_dlp")
         except ImportError as err:
