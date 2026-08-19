@@ -219,7 +219,7 @@ def test_live_stream_url_is_fetchable_the_moment_it_is_handed_over(provider):
     )
 
 
-def test_live_playback_path_streams_bounded_chunks(provider, monkeypatch):
+def test_live_playback_path_streams_bounded_chunks(provider):
     """Fetch through ``get_audio_stream``, the way Music Assistant now plays.
 
     2026-08-19: googlevideo started refusing any fetch without a *bounded*
@@ -232,8 +232,15 @@ def test_live_playback_path_streams_bounded_chunks(provider, monkeypatch):
 
     Reads a little over two chunks, because the second request is the one
     that would expose a broken continuation (an off-by-one range, a loop that
-    never advances, a total parsed wrongly). The chunk size is shrunk so that
-    is a few hundred KiB, not 20 MiB, per run.
+    never advances, a total parsed wrongly).
+
+    At the PRODUCTION chunk size, deliberately and at the cost of a couple of
+    MiB per run. The first version of this test shrank the chunk to 128 KiB
+    to save bandwidth, and that is precisely why it passed while production
+    403d: googlevideo caps the *size* of a bounded range (1 MiB passed, the
+    then-10-MiB production chunk did not), and a canary probing with a
+    different size than production proves nothing about production. If the
+    chunk size ever needs to change, change it in the provider, never here.
     """
     aiohttp = pytest.importorskip("aiohttp")
 
@@ -242,8 +249,7 @@ def test_live_playback_path_streams_bounded_chunks(provider, monkeypatch):
     provider._prefer_quality = True
     details = asyncio.run(provider.get_stream_details(video_id, MediaType.TRACK))
 
-    chunk_size = 128 * 1024
-    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", chunk_size)
+    chunk_size = ytm.STREAM_CHUNK_SIZE
 
     async def _stream_past_the_first_chunk() -> bytes:
         async with aiohttp.ClientSession() as session:
