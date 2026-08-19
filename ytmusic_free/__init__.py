@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import asyncio
 import importlib
@@ -87,6 +87,19 @@ if TYPE_CHECKING:
 YTM_DOMAIN = "https://music.youtube.com"
 VARIOUS_ARTISTS_YTM_ID = "UCUTXlgdcKU5vfzFqHOWIvkA"
 DEFAULT_STREAM_URL_EXPIRATION = 3600  # 1 hour
+
+# googlevideo answers 403 to any request whose Range header is missing or
+# open-ended ("bytes=0-"), while a bounded "bytes=0-1023" against the very same
+# URL answers 206 (the rqh=1 URL parameter; enforcement observed 2026-08-19,
+# breaking every install at once with extraction still green). ffmpeg only ever
+# opens URLs the unbounded way, so the URL cannot be handed to Music Assistant
+# as StreamType.HTTP; the provider fetches the bytes itself in bounded chunks
+# instead. 10 MiB mirrors yt-dlp's own http_chunk_size for these clients.
+STREAM_CHUNK_SIZE = 10 * 1024 * 1024
+
+# How much of a chunk's body to hand over per yield. Purely a buffering knob
+# for the pipe into ffmpeg; it has no effect on the HTTP requests.
+STREAM_YIELD_SIZE = 64 * 1024
 
 # Longest pre-roll window we will hold a track start for. A single skippable
 # ad is around 5 seconds (issue #51 measured 4 to 5) but yt-dlp sums a whole
@@ -747,6 +760,19 @@ def _preroll_wait_seconds(fmt: dict[str, Any], now: float | None = None) -> floa
 
     wait = available_at - now
     return wait if wait > 0 else 0.0
+
+
+def _content_range_total(value: str | None) -> int | None:
+    """Total byte size out of a ``Content-Range: bytes 0-1023/16492447`` header.
+
+    None for an absent, malformed or ``*``-sized header, so the caller falls
+    back to reading until a chunk comes back short instead of trusting a
+    number that was never there.
+    """
+    if not value or "/" not in value:
+        return None
+    total = value.rsplit("/", 1)[1].strip()
+    return int(total) if total.isdigit() else None
 
 
 async def setup(
@@ -2114,11 +2140,27 @@ class YoutubeMusicFreeProvider(MusicProvider):
             audio_format=AudioFormat(
                 content_type=content_type,
             ),
-            stream_type=StreamType.HTTP,
+            # CUSTOM rather than HTTP: googlevideo now refuses unbounded
+            # fetches (see STREAM_CHUNK_SIZE), so ffmpeg cannot open this URL
+            # itself. Music Assistant instead pulls the bytes through
+            # get_audio_stream below.
+            stream_type=StreamType.CUSTOM,
+            # Unused for CUSTOM playback, but Music Assistant's logging and the
+            # live canary both read the resolved URL from here.
             path=url,
-            can_seek=True,
+            # False on purpose: with can_seek=False Music Assistant hands the
+            # seek offset to ffmpeg, which decodes and discards up to it. Seeking
+            # at this layer would mean starting the fetch at a byte offset, and a
+            # WebM/MP4 stream without its byte-0 headers is unparseable.
+            can_seek=False,
             allow_seek=True,
             expiration=expiration,
+            data={
+                "url": url,
+                # yt-dlp's per-format headers (User-Agent etc.), sent on every
+                # chunk so the fetch looks like the client that minted the URL.
+                "headers": dict(stream_format.get("http_headers") or {}),
+            },
         )
         if channels := stream_format.get("audio_channels"):
             with suppress(ValueError, TypeError):
@@ -2154,6 +2196,76 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 if end is not None:
                     stream_details.duration = end - (start or 0)
         return stream_details
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream the resolved audio in bounded-range chunks.
+
+        googlevideo enforces *bounded* Range requests on these URLs: no Range
+        header or an open-ended ``bytes=0-`` answers 403, ``bytes=0-N`` answers
+        206 from the same URL (see STREAM_CHUNK_SIZE). ffmpeg only opens URLs
+        the unbounded way, so the provider fetches the bytes itself, the same
+        way YouTube's own clients and yt-dlp do, and hands them down the pipe.
+
+        ``seek_position`` is part of the MusicProvider signature but always
+        arrives as 0 here: ``can_seek`` is False, so Music Assistant seeks by
+        decoding and discarding on its side of the pipe. That is deliberate; a
+        byte-offset start would drop the container headers that live at byte 0
+        and hand ffmpeg an unparseable stream.
+
+        The end of the file is detected two ways: the total from the first
+        response's ``Content-Range``, and a chunk answering with fewer bytes
+        than asked for. The second also covers a server that ignores the range
+        and answers 200 with the whole body.
+        """
+        del seek_position  # always 0, see docstring
+        data = streamdetails.data if isinstance(streamdetails.data, dict) else {}
+        url = data.get("url") or streamdetails.path
+        base_headers: dict[str, str] = dict(data.get("headers") or {})
+        pos = 0
+        total: int | None = None
+        while total is None or pos < total:
+            end = pos + STREAM_CHUNK_SIZE - 1
+            if total is not None:
+                end = min(end, total - 1)
+            headers = {**base_headers, "Range": f"bytes={pos}-{end}"}
+            received = 0
+            async with self.mass.http_session.get(url, headers=headers) as response:
+                if response.status == 403:
+                    # The strongest signal this provider has that the URL is
+                    # dead (expired, or enforcement changed again). Name the
+                    # position: a 403 at byte 0 and a 403 mid-track are
+                    # different bugs.
+                    raise UnplayableMediaError(
+                        f"googlevideo answered 403 at bytes {pos}-{end} for "
+                        f"{streamdetails.item_id}"
+                    )
+                if response.status == 416:
+                    # Asked past the end of the file: a Content-Range total
+                    # that overstated the size. Everything real was streamed.
+                    return
+                response.raise_for_status()
+                if total is None and response.status == 206:
+                    total = _content_range_total(response.headers.get("Content-Range"))
+                async for part in response.content.iter_chunked(STREAM_YIELD_SIZE):
+                    received += len(part)
+                    yield part
+            if response.status == 200:
+                # The server ignored the Range header and the whole body just
+                # streamed out in one response. Asking again would replay it.
+                return
+            if received < (end - pos + 1):
+                # Short answer: either the file ended inside this chunk, or
+                # the connection dropped mid-chunk. Content-Range tells the
+                # two apart; without one, short can only be treated as done.
+                if total is None or pos + received >= total:
+                    return
+                # Truncated read. Resume from what actually arrived rather
+                # than skipping the gap.
+                pos += received
+                continue
+            pos = end + 1
 
     # ------------------------------------------------------------------
     # Library methods (require authentication)

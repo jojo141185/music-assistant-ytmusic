@@ -31,11 +31,13 @@ from __future__ import annotations
 import asyncio
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
 from music_assistant_models.enums import ContentType, MediaType
 
+import ytmusic_free as ytm
 from ytmusic_free import PODCAST_EPISODE_SPLITTER
 
 pytestmark = pytest.mark.live
@@ -76,8 +78,16 @@ def _fetch_range(url: str) -> tuple[int, bytes]:
 
     Deliberately stdlib: the live suite installs nothing beyond what the offline
     one needs, and a Range GET is not worth a dependency. Sends no headers other
-    than the range, because Music Assistant does not send any either, so a URL
-    that only works with yt-dlp's own headers should fail here rather than pass.
+    than the range, so a URL that only works with yt-dlp's own headers should
+    fail here rather than pass.
+
+    The range is *bounded*, which since 2026-08 is the only kind googlevideo
+    answers, and that limits what this probe can prove: it checks the URL is
+    valid and serving, not that Music Assistant's fetch of it would succeed.
+    It stayed green through the whole bounded-range outage while ffmpeg's
+    unbounded fetches answered 403 for every user. The playback-shaped check
+    is ``test_live_playback_path_streams_bounded_chunks``, which fetches
+    through the provider's own ``get_audio_stream``.
     """
     request = urllib.request.Request(url, headers={"Range": f"bytes=0-{PROBE_BYTES - 1}"})
     with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - https url from yt-dlp
@@ -206,6 +216,63 @@ def test_live_stream_url_is_fetchable_the_moment_it_is_handed_over(provider):
     assert len(body) > 0, (
         f"{video_id}: googlevideo accepted the range request and returned no "
         "bytes, which is not a stream anyone can play"
+    )
+
+
+def test_live_playback_path_streams_bounded_chunks(provider, monkeypatch):
+    """Fetch through ``get_audio_stream``, the way Music Assistant now plays.
+
+    2026-08-19: googlevideo started refusing any fetch without a *bounded*
+    Range header. Extraction stayed green, ``_fetch_range`` stayed green (it
+    is bounded), and playback broke for every install at once, because ffmpeg
+    only fetches unbounded. The provider now pulls the bytes itself in bounded
+    chunks; this walks that exact code path against the real googlevideo, so
+    the canary fails when playback fails rather than when a probe that merely
+    resembles playback fails.
+
+    Reads a little over two chunks, because the second request is the one
+    that would expose a broken continuation (an off-by-one range, a loop that
+    never advances, a total parsed wrongly). The chunk size is shrunk so that
+    is a few hundred KiB, not 20 MiB, per run.
+    """
+    aiohttp = pytest.importorskip("aiohttp")
+
+    video_id, _ = _resolve_first_available(provider)
+    provider._yt_dlp_module = None
+    provider._prefer_quality = True
+    details = asyncio.run(provider.get_stream_details(video_id, MediaType.TRACK))
+
+    chunk_size = 128 * 1024
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", chunk_size)
+
+    async def _stream_past_the_first_chunk() -> bytes:
+        async with aiohttp.ClientSession() as session:
+            provider.mass = SimpleNamespace(http_session=session)
+            collected = b""
+            generator = provider.get_audio_stream(details)
+            try:
+                async for part in generator:
+                    collected += part
+                    if len(collected) > 2 * chunk_size:
+                        break
+            finally:
+                await generator.aclose()
+            return collected
+
+    try:
+        body = asyncio.run(_stream_past_the_first_chunk())
+    except Exception as err:  # noqa: BLE001 - the failure text is the deliverable
+        pytest.fail(
+            f"{video_id}: the provider's own streaming path failed: "
+            f"{type(err).__name__}: {err}. This is what a user hears as "
+            "'Skipping unplayable item'; the URL probes above passing while "
+            "this fails means the enforcement rules changed again."
+        )
+
+    assert len(body) > 2 * chunk_size, (
+        f"{video_id}: the stream ended after {len(body)} bytes, before the "
+        "second chunk completed. Either the track is implausibly short or the "
+        "chunk loop stopped advancing."
     )
 
 

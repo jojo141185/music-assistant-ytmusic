@@ -133,6 +133,7 @@ def _install_music_assistant_models() -> None:
 
     class _StreamType(str, Enum):
         HTTP = "http"
+        CUSTOM = "custom"
 
     enums.AlbumType = _AlbumType
     enums.ConfigEntryType = _ConfigEntryType
@@ -342,6 +343,9 @@ def _install_music_assistant_models() -> None:
         expiration: int = 0
         duration: int | None = None
         extra_input_args: list = field(default_factory=list)
+        # Free-form provider payload upstream; get_audio_stream reads the
+        # stream url and headers from it.
+        data: object = None
 
     streamdetails.StreamDetails = _StreamDetails
 

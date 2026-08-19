@@ -163,7 +163,8 @@ NULLABLE_PODCAST_EPISODE_FIELDS: tuple[str, ...] = (
 )
 
 # ``StreamDetails`` fields the provider sets, either as constructor arguments
-# or by assignment afterwards.
+# or by assignment afterwards. ``data`` carries the stream url and headers over
+# to ``get_audio_stream``; losing it upstream would sever playback entirely.
 REQUIRED_STREAM_DETAILS_FIELDS: tuple[str, ...] = (
     "provider",
     "item_id",
@@ -175,7 +176,14 @@ REQUIRED_STREAM_DETAILS_FIELDS: tuple[str, ...] = (
     "expiration",
     "duration",
     "extra_input_args",
+    "data",
 )
+
+# ``StreamType`` members the provider names. CUSTOM is the one playback stands
+# on: googlevideo refuses the unbounded fetches ffmpeg makes (bounded-Range
+# enforcement, 2026-08), so the provider streams the audio itself through
+# ``get_audio_stream``, and that hook is only ever called for CUSTOM.
+REQUIRED_STREAM_TYPE_MEMBERS: tuple[str, ...] = ("CUSTOM",)
 
 # Names for "this url is not fetchable until T". Upstream has none of them, and
 # that absence is load-bearing: it is why the provider sits out YouTube's
