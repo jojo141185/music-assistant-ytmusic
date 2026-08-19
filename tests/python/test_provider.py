@@ -17,10 +17,12 @@ from music_assistant_models.enums import (
     ImageType,
     MediaType,
     ProviderFeature,
+    StreamType,
 )
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
+    UnplayableMediaError,
 )
 
 import ytmusic_free as ytm
@@ -136,7 +138,7 @@ def test_build_auth_headers_falls_back_to_secure_3papisid_when_sapisid_missing(
     _forbid_open(monkeypatch)
     cookie = "__Secure-3PAPISID=fallbackValue; SID=foo"
     headers = provider._build_auth_headers(cookie)
-    # The hash uses the extracted SAPISID — we can't see the secret, but we can
+    # The hash uses the extracted SAPISID â€” we can't see the secret, but we can
     # confirm the same input produces a stable-shape header.
     assert headers["authorization"].startswith("SAPISIDHASH ")
 
@@ -1213,7 +1215,7 @@ def test_search_skips_invalid_items(provider):
     mock = MagicMock()
     mock.search = MagicMock(
         return_value=[
-            # No videoId — should be silently skipped.
+            # No videoId â€” should be silently skipped.
             {
                 "resultType": "song",
                 "title": "broken",
@@ -1613,6 +1615,249 @@ def test_get_stream_details_no_trim_has_no_args(provider):
     provider._get_stream_format = _fmt
     sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
     assert sd.extra_input_args == []
+
+
+# ---------------------------------------------------------------------------
+# Bounded-range streaming
+#
+# googlevideo answers 403 to any fetch whose Range header is missing or
+# open-ended, while a bounded range against the same URL answers 206 (the
+# rqh=1 parameter; enforcement observed 2026-08-19, every install at once,
+# extraction still green). ffmpeg only fetches the unbounded way, so the
+# provider stopped handing it the URL: get_stream_details reports CUSTOM and
+# get_audio_stream pulls the bytes itself in bounded chunks.
+# ---------------------------------------------------------------------------
+
+
+class _RangeContent:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def iter_chunked(self, size: int):
+        async def _gen():
+            for i in range(0, len(self._body), size):
+                yield self._body[i : i + size]
+
+        return _gen()
+
+
+class _RangeResponse:
+    def __init__(self, status: int, body: bytes = b"", headers: dict | None = None):
+        self.status = status
+        self.headers = headers or {}
+        self.content = _RangeContent(body)
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeGoogleVideo:
+    """Serve a blob the way googlevideo now does: bounded Range or nothing.
+
+    ``requests`` records every (url, headers) pair so tests can assert what
+    was actually sent, not just what came back.
+    """
+
+    def __init__(
+        self,
+        blob: bytes,
+        *,
+        ignore_range: bool = False,
+        send_content_range: bool = True,
+        truncate_first: int | None = None,
+    ):
+        self.blob = blob
+        self.ignore_range = ignore_range
+        self.send_content_range = send_content_range
+        self.truncate_first = truncate_first
+        self.requests: list[tuple[str, dict]] = []
+
+    def get(self, url, headers=None, **_kwargs):
+        headers = dict(headers or {})
+        self.requests.append((url, headers))
+        if self.ignore_range:
+            return _RangeResponse(200, self.blob)
+        rng = headers.get("Range", "")
+        if not rng.startswith("bytes=") or rng.endswith("-"):
+            return _RangeResponse(403)
+        start_s, end_s = rng[len("bytes=") :].split("-")
+        start, end = int(start_s), int(end_s)
+        if start >= len(self.blob):
+            return _RangeResponse(416)
+        chunk = self.blob[start : end + 1]
+        if self.truncate_first is not None and len(self.requests) == 1:
+            chunk = chunk[: self.truncate_first]
+        response_headers = {}
+        if self.send_content_range:
+            response_headers["Content-Range"] = (
+                f"bytes {start}-{start + len(chunk) - 1}/{len(self.blob)}"
+            )
+        return _RangeResponse(206, chunk, response_headers)
+
+
+def _stream_all(provider, sd) -> bytes:
+    async def _collect():
+        return b"".join([part async for part in provider.get_audio_stream(sd)])
+
+    return asyncio.run(_collect())
+
+
+def _custom_stream_details(url="https://stream.example/x", headers=None):
+    from music_assistant_models.streamdetails import StreamDetails
+
+    return StreamDetails(
+        provider="test", item_id="vid42", data={"url": url, "headers": headers or {}}
+    )
+
+
+def _mass_with_session(session):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(http_session=session)
+
+
+def test_get_stream_details_is_custom_and_carries_url_and_headers(provider):
+    """The URL never reaches ffmpeg; it travels to get_audio_stream via data."""
+
+    async def _fmt(video_id):
+        return {
+            "url": "https://stream.example/x",
+            "ext": "m4a",
+            "http_headers": {"User-Agent": "com.google.android.apps.youtube.vr"},
+        }
+
+    provider._get_stream_format = _fmt
+    sd = asyncio.run(provider.get_stream_details("abc12345678", MediaType.TRACK))
+    assert sd.stream_type == StreamType.CUSTOM
+    assert sd.data == {
+        "url": "https://stream.example/x",
+        "headers": {"User-Agent": "com.google.android.apps.youtube.vr"},
+    }
+    # Kept for logging and the live canary, not for playback.
+    assert sd.path == "https://stream.example/x"
+    # Seeking stays with ffmpeg: a WebM stream started at a byte offset has no
+    # container headers and cannot be parsed.
+    assert sd.can_seek is False
+    assert sd.allow_seek is True
+
+
+def test_get_audio_stream_fetches_in_bounded_ranges(provider, monkeypatch):
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    ranges = [h["Range"] for _, h in session.requests]
+    # Every request bounded, contiguous, and capped to the Content-Range total.
+    assert ranges == ["bytes=0-4", "bytes=5-9", "bytes=10-11"]
+
+
+def test_get_audio_stream_sends_the_minting_clients_headers(provider, monkeypatch):
+    """Every chunk goes out with yt-dlp's per-format headers plus the range."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    session = _FakeGoogleVideo(b"0123456789")
+    provider.mass = _mass_with_session(session)
+
+    _stream_all(
+        provider, _custom_stream_details(headers={"User-Agent": "android-vr"})
+    )
+
+    assert session.requests, "no request was made at all"
+    for _, headers in session.requests:
+        assert headers["User-Agent"] == "android-vr"
+        assert "Range" in headers
+
+
+def test_get_audio_stream_raises_unplayable_on_403(provider):
+    class _Deny:
+        def get(self, url, headers=None, **_kwargs):
+            return _RangeResponse(403)
+
+    provider.mass = _mass_with_session(_Deny())
+    with pytest.raises(UnplayableMediaError):
+        _stream_all(provider, _custom_stream_details())
+
+
+def test_get_audio_stream_handles_a_server_that_ignores_range(provider, monkeypatch):
+    """A 200 means the whole body already streamed; asking again would replay it."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob, ignore_range=True)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert len(session.requests) == 1
+
+
+def test_get_audio_stream_stops_without_content_range(provider, monkeypatch):
+    """No total to trust, so a short chunk is the only end-of-file signal."""
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob, send_content_range=False)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert len(session.requests) == 3  # 5 + 5 + short 2, then stop
+
+
+def test_get_audio_stream_treats_416_as_the_end(provider, monkeypatch):
+    """A blob that is an exact multiple of the chunk size never answers short.
+
+    Without a Content-Range total the loop only finds the end by asking past
+    it, and googlevideo says 416 to that, not 206-with-nothing.
+    """
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789"  # exactly two chunks
+    session = _FakeGoogleVideo(blob, send_content_range=False)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert [h["Range"] for _, h in session.requests] == [
+        "bytes=0-4",
+        "bytes=5-9",
+        "bytes=10-14",
+    ]
+
+
+def test_get_audio_stream_resumes_a_truncated_chunk(provider, monkeypatch):
+    """A connection drop mid-chunk resumes from the last byte received.
+
+    Skipping the gap would splice two distant parts of the file together,
+    which decodes as an audible glitch rather than an error.
+    """
+    monkeypatch.setattr(ytm, "STREAM_CHUNK_SIZE", 5)
+    blob = b"0123456789ab"
+    session = _FakeGoogleVideo(blob, truncate_first=3)
+    provider.mass = _mass_with_session(session)
+
+    out = _stream_all(provider, _custom_stream_details())
+
+    assert out == blob
+    assert [h["Range"] for _, h in session.requests][:2] == ["bytes=0-4", "bytes=3-7"]
+
+
+def test_content_range_total_parses_and_rejects():
+    assert ytm._content_range_total("bytes 0-1023/16492447") == 16492447
+    assert ytm._content_range_total("bytes 0-1023/*") is None
+    assert ytm._content_range_total("") is None
+    assert ytm._content_range_total(None) is None
+    assert ytm._content_range_total("garbage") is None
 
 
 # ---------------------------------------------------------------------------
@@ -3198,7 +3443,7 @@ def test_get_artist_unknown_prefix_returns_stub(provider):
 
 def test_get_artist_non_channel_id_not_found_without_ytm_call(provider):
     """A non-channel id (e.g. one pulled from track metadata) must not be
-    handed to YTM — it would return HTTP 400. We raise MediaNotFoundError
+    handed to YTM â€” it would return HTTP 400. We raise MediaNotFoundError
     without ever calling get_artist (issue #18)."""
     from music_assistant_models.errors import MediaNotFoundError
 
@@ -3270,7 +3515,7 @@ def test_get_similar_tracks_parses_returned_tracks(provider):
                     "title": "Song One",
                     "artists": [{"id": "UCart", "name": "An Artist"}],
                 },
-                # Missing videoId — must be skipped, not crash the radio fill.
+                # Missing videoId â€” must be skipped, not crash the radio fill.
                 {"title": "broken", "artists": [{"id": "UCart", "name": "A"}]},
             ]
         }
@@ -3310,7 +3555,7 @@ def test_recommendations_empty_when_not_authenticated(provider):
 
 
 # ---------------------------------------------------------------------------
-# library_add / library_remove — 403 no-op for user-owned items
+# library_add / library_remove â€” 403 no-op for user-owned items
 # ---------------------------------------------------------------------------
 
 
@@ -3362,7 +3607,7 @@ def test_library_add_non_403_error_returns_false(provider):
 
 
 def test_library_add_403_on_artist_is_not_swallowed(provider):
-    """The 403 no-op only applies to ALBUM/PLAYLIST — artist subscription failure is real."""
+    """The 403 no-op only applies to ALBUM/PLAYLIST â€” artist subscription failure is real."""
     _make_authed_provider_with_rate_failure(
         provider, RuntimeError("Server returned HTTP 403: Forbidden.")
     )
@@ -3464,7 +3709,7 @@ def test_build_auth_headers_substring_only_does_not_satisfy_recommendation(provi
     """A bare mention like '__Secure-1PSID-other=v' must not count as having that cookie."""
     _forbid_open(monkeypatch)
     handler = _attach_capture(provider)
-    # The cookie names parsed are the bit before '=' — make sure we match exactly.
+    # The cookie names parsed are the bit before '=' â€” make sure we match exactly.
     cookie = "__Secure-3PAPISID=a; __Secure-1PSID-typo=oops; SAPISID=b"
     provider._build_auth_headers(cookie)
     joined = " ".join(handler.messages())
@@ -3487,7 +3732,7 @@ def test_is_auth_lapse_detects_unauthorized_text(provider):
 def test_is_auth_lapse_ignores_non_auth_errors(provider):
     assert provider._is_auth_lapse(RuntimeError("Connection reset by peer")) is False
     assert provider._is_auth_lapse(RuntimeError("HTTP 500")) is False
-    # 403 alone is intentionally not treated as auth lapse here — it has the
+    # 403 alone is intentionally not treated as auth lapse here â€” it has the
     # separate owned-playlist no-op path. Auth lapses surface as 401.
     assert provider._is_auth_lapse(RuntimeError("HTTP 403: Forbidden")) is False
 
@@ -3655,7 +3900,7 @@ def test_probe_session_alive_none_on_transient_error(provider):
 
 
 def test_probe_session_alive_none_when_method_unavailable(provider):
-    """Older ytmusicapi without get_account_info — undetermined, never False."""
+    """Older ytmusicapi without get_account_info â€” undetermined, never False."""
     provider._ytmusic = object()  # bare object, no methods
     assert provider._probe_session_alive() is None
 
@@ -3725,7 +3970,7 @@ def test_empty_library_sync_raises_on_the_very_first_sync_after_a_lapse(provider
 
 
 def test_repeated_empty_library_sync_stays_silent_while_the_session_is_alive(provider):
-    """Empty → empty on a live session must stay silent."""
+    """Empty â†’ empty on a live session must stay silent."""
     provider._authenticated = True
     handler = _attach_capture(provider)
     mock = MagicMock()
@@ -3765,7 +4010,7 @@ def test_populated_then_empty_triggers_probe_and_raises_on_lapse(provider):
 
 
 def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
-    """Probe confirms session — treat empty as a real empty library, no raise."""
+    """Probe confirms session â€” treat empty as a real empty library, no raise."""
     provider._authenticated = True
     provider._auth_lapse_warned = False
     handler = _attach_capture(provider)
@@ -3775,7 +4020,7 @@ def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
     provider._ytmusic = mock
 
     _consume(provider.get_library_tracks())
-    # Probe says alive — generator returns empty without raising.
+    # Probe says alive â€” generator returns empty without raising.
     result = _consume(provider.get_library_tracks())
     assert result == []
     assert mock.get_account_info.call_count == 1
@@ -3783,7 +4028,7 @@ def test_populated_then_empty_does_not_raise_when_probe_alive(provider):
 
 
 def test_populated_then_empty_does_not_raise_on_undetermined_probe(provider):
-    """Transient probe error must not raise — that would invent a false alarm.
+    """Transient probe error must not raise â€” that would invent a false alarm.
 
     It does warn, though. This is the one remaining path that can still let a
     library be deleted, so it should not pass in silence.

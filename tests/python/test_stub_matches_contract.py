@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 # Imports below are resolved against the stubs registered in conftest.py.
-from music_assistant_models.enums import ContentType, MediaType
+from music_assistant_models.enums import ContentType, MediaType, StreamType
 
 # Imported from media_items, not streamdetails, because that is the path the
 # provider itself uses. Upstream re-exports the same class from both.
@@ -114,6 +114,13 @@ def test_stub_media_type_has_the_required_members():
         name for name in ma_contract.REQUIRED_MEDIA_TYPE_MEMBERS if not hasattr(MediaType, name)
     ]
     assert not missing, f"stub MediaType is missing {missing}; see tests/ma_contract.py"
+
+
+def test_stub_stream_type_has_the_required_members():
+    missing = [
+        name for name in ma_contract.REQUIRED_STREAM_TYPE_MEMBERS if not hasattr(StreamType, name)
+    ]
+    assert not missing, f"stub StreamType is missing {missing}; see tests/ma_contract.py"
 
 
 # Deliberately not asserted: that the stub ``ProviderFeature`` carries every name

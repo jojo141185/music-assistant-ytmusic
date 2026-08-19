@@ -91,6 +91,20 @@ def test_media_type_has_the_members_the_provider_uses(real_models):
     assert not missing, f"upstream MediaType lost members the provider uses: {missing}"
 
 
+def test_stream_type_has_the_members_the_provider_uses(real_models):
+    """CUSTOM is what all playback stands on since the bounded-range fix.
+
+    googlevideo refuses the unbounded fetches ffmpeg makes, so the provider
+    streams audio itself through ``get_audio_stream``, and Music Assistant
+    only calls that hook when the stream_type is CUSTOM.
+    """
+    stream_type = real_models.enums.StreamType
+    missing = [
+        name for name in ma_contract.REQUIRED_STREAM_TYPE_MEMBERS if not hasattr(stream_type, name)
+    ]
+    assert not missing, f"upstream StreamType lost members the provider uses: {missing}"
+
+
 def test_provider_feature_has_the_members_the_provider_declares(real_models):
     """The one contract failure here that would take the whole provider down.
 
