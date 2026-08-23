@@ -1074,7 +1074,7 @@ def test_get_config_entries_returns_expected_keys():
     ]
     cookie_entry = next(e for e in entries if e.key == ytm.CONF_COOKIE)
     assert cookie_entry.depends_on == ytm.CONF_AUTH_TYPE
-    assert cookie_entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+    assert cookie_entry.depends_on_value == ytm.AUTH_TYPE_COOKIE
 
 
 def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
@@ -1082,7 +1082,38 @@ def test_auth_user_entry_is_cookie_only_and_defaults_to_zero():
     entry = next(e for e in entries if e.key == ytm.CONF_AUTH_USER)
     assert entry.default_value == 0
     assert entry.depends_on == ytm.CONF_AUTH_TYPE
-    assert entry.depends_on_value == [ytm.AUTH_TYPE_COOKIE]
+    assert entry.depends_on_value == ytm.AUTH_TYPE_COOKIE
+
+
+def test_depends_on_value_is_a_scalar_everywhere():
+    """Both MA 2.9's frontend and MA 2.10's server compare depends_on_value
+    with plain equality, never containment, so a list can never match a
+    selected option. Every gated entry must use the scalar form."""
+    entries = asyncio.run(ytm.get_config_entries(mass=None))
+    for entry in entries:
+        assert not isinstance(entry.depends_on_value, list), entry.key
+
+
+def test_instance_get_config_entries_matches_module_hook(provider):
+    """MA 2.10 resolves the options page via the no-argument instance method;
+    2.9 uses the module-level hook (issue #78). Both must return the same
+    entries, and the instance method must be callable with no arguments,
+    exactly as the 2.10 config controller calls it."""
+    from_instance = asyncio.run(provider.get_config_entries())
+    from_module = asyncio.run(ytm.get_config_entries(mass=None))
+    # Full-object equality, not just keys: the stub ConfigEntry is a dataclass,
+    # so this pins every field (type, options, depends_on gating, defaults) to
+    # stay identical between the 2.9 and 2.10 paths.
+    assert list(from_instance) == list(from_module)
+
+
+def test_instance_get_config_entries_needs_no_init(provider):
+    """2.10 calls the instance method on every load, before handle_async_init,
+    so it must work on a freshly constructed provider with no client, no
+    config reads, and no async-init state."""
+    provider._ytmusic = None
+    entries = asyncio.run(provider.get_config_entries())
+    assert len(entries) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -1110,24 +1141,47 @@ def test_search_artist_dispatches_with_artists_filter(provider):
     assert captured["filter"] == "artists"
 
 
-def test_search_track_dispatches_with_songs_filter(provider):
-    captured = {}
+def test_search_track_dispatches_with_songs_then_videos_filter(provider):
+    """A track search runs the songs filter and then the videos filter: the
+    songs tab only sees the YTM catalog, so live recordings and other plain
+    YouTube uploads would otherwise never surface (issue #77)."""
+    captured = []
 
     def _search(query, filter, limit):
-        captured["filter"] = filter
+        captured.append(filter)
         return []
 
     mock = MagicMock()
     mock.search = _search
     provider._ytmusic = mock
     asyncio.run(provider.search("foo", [MediaType.TRACK], limit=3))
-    assert captured["filter"] == "songs"
+    assert captured == ["songs", "videos"]
+
+
+def test_search_without_tracks_never_calls_videos_filter(provider):
+    """The videos pass exists purely to widen track results; a search that
+    asks for no tracks must not pay for it."""
+    captured = []
+
+    def _search(query, filter, limit):
+        captured.append(filter)
+        return []
+
+    mock = MagicMock()
+    mock.search = _search
+    provider._ytmusic = mock
+    asyncio.run(
+        provider.search("foo", [MediaType.ARTIST, MediaType.PLAYLIST], limit=3)
+    )
+    assert captured == ["artists", "playlists"]
 
 
 def test_search_multi_type_runs_filtered_call_per_type(provider):
     """Multi-type search issues one filtered call per type, not one unfiltered
     call. An unfiltered YTM search skews to songs/videos, so artists and
-    playlists rarely surface (issue #18)."""
+    playlists rarely surface (issue #18). The extra videos pass for tracks
+    (issue #77) always runs last, so catalog songs rank above videos in the
+    merged track list."""
     captured = []
 
     def _search(query, filter, limit):
@@ -1144,7 +1198,7 @@ def test_search_multi_type_runs_filtered_call_per_type(provider):
             limit=3,
         )
     )
-    assert captured == ["artists", "albums", "songs", "playlists"]
+    assert captured == ["artists", "albums", "songs", "playlists", "videos"]
     assert None not in captured
 
 
@@ -1154,6 +1208,8 @@ def test_search_one_failing_filter_does_not_sink_others(provider):
     def _search(query, filter, limit):
         if filter == "artists":
             raise RuntimeError("boom")
+        if filter != "songs":
+            return []
         return [
             {
                 "resultType": "song",
@@ -1212,27 +1268,213 @@ def test_search_parses_returned_items_by_result_type(provider):
 
 def test_search_skips_invalid_items(provider):
     """An item missing a required field should be skipped, not crash the search."""
+    songs = [
+        # No videoId â€” should be silently skipped.
+        {
+            "resultType": "song",
+            "title": "broken",
+            "artists": [{"id": "UCart", "name": "A"}],
+        },
+        {
+            "resultType": "song",
+            "videoId": "good",
+            "title": "ok",
+            "artists": [{"id": "UCart", "name": "A"}],
+        },
+    ]
     mock = MagicMock()
     mock.search = MagicMock(
-        return_value=[
-            # No videoId â€” should be silently skipped.
-            {
-                "resultType": "song",
-                "title": "broken",
-                "artists": [{"id": "UCart", "name": "A"}],
-            },
-            {
-                "resultType": "song",
-                "videoId": "good",
-                "title": "ok",
-                "artists": [{"id": "UCart", "name": "A"}],
-            },
-        ]
+        side_effect=lambda query, filter, limit: songs if filter == "songs" else []
     )
     provider._ytmusic = mock
     results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
     assert len(results.tracks) == 1
     assert results.tracks[0].item_id == "good"
+
+
+def test_search_merges_videos_below_catalog_songs(provider):
+    """Video results surface in track search but rank below catalog songs,
+    regardless of relevance ordering within each tab (issue #77)."""
+    by_filter = {
+        "songs": [
+            {
+                "resultType": "song",
+                "videoId": "song1",
+                "title": "Catalog Song",
+                "artists": [{"id": "UCart", "name": "A"}],
+            }
+        ],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "vid1",
+                "title": "Live in Madrid",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "artists": [{"id": None, "name": "Some Channel"}],
+            }
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["song1", "vid1"]
+
+
+def test_search_dedupes_same_video_id_across_filters(provider):
+    """The songs and videos tabs should never share an id, but the backend has
+    handed out counterpart ids before (ytmusicapi #739); a repeat must not
+    become a duplicate row."""
+    same = {
+        "resultType": "song",
+        "videoId": "dup1",
+        "title": "Song",
+        "artists": [{"id": "UCart", "name": "A"}],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(return_value=[same])
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["dup1"]
+
+
+def test_search_skips_podcast_episodes_from_videos_filter(provider):
+    """The videos filter forces resultType "video" onto the podcast episodes
+    it returns; only videoType tells them apart. Episodes belong to the
+    podcast domain, not in track results."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "ep1",
+                "title": "Some Episode",
+                "videoType": "MUSIC_VIDEO_TYPE_PODCAST_EPISODE",
+                "artists": [{"id": None, "name": "Some Show"}],
+            },
+            {
+                "resultType": "video",
+                "videoId": "vid1",
+                "title": "Actual Video",
+                "videoType": "MUSIC_VIDEO_TYPE_OMV",
+                "artists": [{"id": "UCart", "name": "A"}],
+            },
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["vid1"]
+
+
+def test_search_parses_video_without_duration(provider):
+    """A live or ongoing upload shows no duration: ytmusicapi then returns
+    "duration": None and omits "duration_seconds" entirely. The result must
+    still parse instead of being dropped."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "live1",
+                "title": "Concert Stream",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "duration": None,
+                "artists": [{"id": None, "name": "Some Channel"}],
+            }
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["live1"]
+    assert results.tracks[0].duration == 0
+
+
+def test_search_keeps_video_without_artists(provider):
+    """A videos-tab result sometimes carries no artists key at all; those are
+    exactly the plain-YouTube uploads issue #77 surfaces, so they must fall
+    back to a placeholder artist instead of being dropped as malformed."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "noart1",
+                "title": "Bootleg Concert",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+            }
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert [t.item_id for t in results.tracks] == ["noart1"]
+    assert [a.name for a in results.tracks[0].artists] == ["Unknown Artist"]
+
+
+def test_search_song_without_artists_still_skipped(provider):
+    """The artist fallback is scoped to videos-tab results; a catalog song
+    with no artists is malformed data and stays dropped."""
+    songs = [
+        {
+            "resultType": "song",
+            "videoId": "bad1",
+            "title": "Broken Catalog Row",
+        }
+    ]
+    mock = MagicMock()
+    mock.search = MagicMock(
+        side_effect=lambda query, filter, limit: songs if filter == "songs" else []
+    )
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK]))
+    assert results.tracks == []
+
+
+def test_search_reserves_window_space_for_videos(provider):
+    """ytmusicapi treats limit as a floor, so the songs tab alone fills MA's
+    merged [:limit] window; without a reservation the appended videos would be
+    truncated away before ranking and issue #77 would silently persist. Songs
+    must be capped so at least one video survives inside the window."""
+
+    def _song(i):
+        return {
+            "resultType": "song",
+            "videoId": f"s{i}",
+            "title": f"Song {i}",
+            "artists": [{"id": "UCart", "name": "A"}],
+        }
+
+    by_filter = {
+        "songs": [_song(i) for i in range(8)],
+        "videos": [
+            {
+                "resultType": "video",
+                "videoId": "v0",
+                "title": "Live in Madrid",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "artists": [{"id": None, "name": "Some Channel"}],
+            },
+            {
+                "resultType": "video",
+                "videoId": "v1",
+                "title": "Live in Berlin",
+                "videoType": "MUSIC_VIDEO_TYPE_UGC",
+                "artists": [{"id": None, "name": "Some Channel"}],
+            },
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("foo", [MediaType.TRACK], limit=4))
+    # limit 4 with 2 videos available reserves one slot: three songs, then the
+    # first video, nothing beyond the window.
+    assert [t.item_id for t in results.tracks] == ["s0", "s1", "s2", "v0"]
 
 
 # ---------------------------------------------------------------------------
