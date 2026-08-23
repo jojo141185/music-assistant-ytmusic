@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 import asyncio
 import importlib
@@ -239,6 +239,18 @@ SEARCH_FILTER_BY_TYPE = {
     MediaType.PLAYLIST: "playlists",
     MediaType.PODCAST: "podcasts",
 }
+
+# Second search pass for tracks (issue #77). The "songs" filter only sees the
+# YTM catalog, so live recordings and other plain-YouTube uploads never
+# surface through it; the "videos" tab does index them. Kept out of
+# SEARCH_FILTER_BY_TYPE because it is an addition to the TRACK search, not a
+# type of its own.
+SEARCH_FILTER_VIDEOS = "videos"
+
+# The "videos" filter also returns podcast episodes (their resultType is
+# forced to "video" by the filter); those belong to the podcast domain, not in
+# track results.
+VIDEO_TYPE_PODCAST_EPISODE = "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"
 
 # Podcast episode ids carry their show with them: "<podcastId>|<videoId>". Music
 # Assistant looks an episode up on its own, without the show for context, and
@@ -845,7 +857,25 @@ async def get_config_entries(
     action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
-    """Return Config entries to setup this provider."""
+    """Return Config entries to setup this provider.
+
+    Only Music Assistant 2.9.x calls this module-level hook. 2.10 resolves
+    config entries through the ``get_config_entries`` instance method on the
+    provider class instead, with no fallback to this function (issue #78).
+    Both delegate to :func:`_build_config_entries` so the two servers see the
+    same entries.
+    """
+    return _build_config_entries()
+
+
+def _build_config_entries() -> tuple[ConfigEntry, ...]:
+    """The provider's config entries, shared by the 2.9 and 2.10 hooks.
+
+    Every entry is optional with a usable default, deliberately: that is what
+    lets Music Assistant 2.10 create an instance without a ``setup_flow``
+    module, applying defaults and letting the cookie be added later from the
+    options page, same as on 2.9.
+    """
     return (
         ConfigEntry(
             key=CONF_AUTH_TYPE,
@@ -867,7 +897,11 @@ async def get_config_entries(
             default_value="",
             required=False,
             depends_on=CONF_AUTH_TYPE,
-            depends_on_value=[AUTH_TYPE_COOKIE],
+            # A scalar, not a list: both the 2.9 frontend and the 2.10 server
+            # compare depends_on_value with plain equality, so a list never
+            # matches anything and the gate silently stays open (or, on 2.10,
+            # shut). Exact-match single value is the documented contract.
+            depends_on_value=AUTH_TYPE_COOKIE,
             description="Paste your YouTube Music cookie from browser DevTools. "
             "Open music.youtube.com → DevTools → Network → copy the 'Cookie' header "
             "from any request. Must contain __Secure-3PAPISID.",
@@ -879,7 +913,7 @@ async def get_config_entries(
             default_value="",
             required=False,
             depends_on=CONF_AUTH_TYPE,
-            depends_on_value=[AUTH_TYPE_COOKIE],
+            depends_on_value=AUTH_TYPE_COOKIE,
             description="Leave empty for personal account. For brand accounts, "
             "find your ID at myaccount.google.com/brandaccounts or check the "
             "X-Goog-PageId header in browser DevTools on music.youtube.com.",
@@ -891,7 +925,7 @@ async def get_config_entries(
             default_value=0,
             required=False,
             depends_on=CONF_AUTH_TYPE,
-            depends_on_value=[AUTH_TYPE_COOKIE],
+            depends_on_value=AUTH_TYPE_COOKIE,
             description="Which signed-in Google account the cookie should resolve to, "
             "taken from the X-Goog-AuthUser request header on music.youtube.com. "
             "Leave at 0 unless you captured the cookie from a browser with several "
@@ -995,6 +1029,17 @@ class YoutubeMusicFreeProvider(MusicProvider):
     # make one dict shared by every instance, so a populated account would make
     # a second, genuinely empty account raise a false partial-auth error.
     _library_seen_nonempty: dict[str, bool]
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return the config entries for this provider instance.
+
+        Music Assistant 2.10 resolves the options page through this instance
+        method; the module-level hook above exists for 2.9.x, which never
+        calls this one (issue #78). 2.10 also calls it on every load, before
+        ``handle_async_init``, so it must not depend on state assigned there —
+        the entries are static, so that holds trivially.
+        """
+        return _build_config_entries()
 
     async def handle_async_init(self) -> None:
         """Set up the YTMusicFree provider."""
@@ -1252,17 +1297,38 @@ class YoutubeMusicFreeProvider(MusicProvider):
         ]
         if not filters:
             return parsed_results
+        # A track search gets a second pass over the "videos" tab, appended
+        # last so catalog songs come back first and videos rank below them in
+        # the merged results (issue #77).
+        if MediaType.TRACK in media_types:
+            filters.append(SEARCH_FILTER_VIDEOS)
 
-        results: list[dict] = []
+        results: list[tuple[str, dict]] = []
         for ytm_filter in filters:
             # Keep categories independent: one failing filter must not sink
             # the others.
             try:
-                results.extend(await _search_type(ytm_filter))
+                results.extend(
+                    (ytm_filter, item) for item in await _search_type(ytm_filter)
+                )
             except Exception as err:  # noqa: BLE001
                 self.logger.debug("search filter %s failed: %s", ytm_filter, err)
 
-        for result in results:
+        # Tracks are collected per pass instead of straight into the result.
+        # Music Assistant truncates the merged track list to `limit` before it
+        # re-ranks, and ytmusicapi treats `limit` as a floor, so the songs tab
+        # alone already fills that window; videos appended unbounded behind it
+        # would be cut off before anyone saw them, quietly re-losing the
+        # content issue #77 is about. Composing under `limit` here, with a
+        # slice reserved for videos, is the only place that can be done.
+        song_tracks: list[Track] = []
+        video_tracks: list[Track] = []
+        # YTM keeps a song and its music video as distinct ids, so this set
+        # should never fire across the songs/videos passes; it guards against
+        # the backend handing out a counterpart id twice, which it has done
+        # elsewhere (ytmusicapi #739).
+        seen_track_ids: set[str] = set()
+        for ytm_filter, result in results:
             try:
                 result_type = result.get("resultType")
                 if result_type == "artist" and MediaType.ARTIST in media_types:
@@ -1279,11 +1345,28 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 elif (
                     result_type in ("song", "video")
                     and MediaType.TRACK in media_types
+                    # The videos filter forces resultType "video" even on the
+                    # podcast episodes it returns; those belong to the podcast
+                    # domain, not in track results.
+                    and result.get("videoType") != VIDEO_TYPE_PODCAST_EPISODE
                     and (track := self._parse_track(result))
+                    and track.item_id not in seen_track_ids
                 ):
-                    parsed_results.tracks.append(track)
+                    seen_track_ids.add(track.item_id)
+                    if ytm_filter == SEARCH_FILTER_VIDEOS:
+                        video_tracks.append(track)
+                    else:
+                        song_tracks.append(track)
             except (InvalidDataError, KeyError, TypeError):
                 pass  # skip invalid items
+
+        # Catalog songs first, videos below them, together at most `limit`.
+        # The reservation shrinks to what the videos pass actually returned,
+        # so songs only give up window space when there is a video to show.
+        reserve = min(len(video_tracks), max(1, limit // 4))
+        parsed_results.tracks = (
+            song_tracks[: max(0, limit - reserve)] + video_tracks
+        )[:limit]
 
         await self._attach_album_years(parsed_results.tracks)
         return parsed_results
@@ -3107,6 +3190,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
                     item_id=f"unknown_{name_only}",
                     provider=self.instance_id,
                     name=name_only,
+                )
+            ]
+        # A videos-tab search result sometimes carries no artists at all: the
+        # plain-YouTube uploads issue #77 exists to surface are exactly the
+        # ones whose subtitle has no linked channel. Dropping them would
+        # re-lose that content, so they get the same placeholder _minimal_track
+        # uses. Everything else keeps the raise: a catalog song without artists
+        # is malformed data, not a known shape.
+        if not track.artists and track_obj.get("resultType") == "video":
+            track.artists = [
+                ItemMapping(
+                    media_type=MediaType.ARTIST,
+                    item_id="unknown",
+                    provider=self.instance_id,
+                    name="Unknown Artist",
                 )
             ]
         if not track.artists:

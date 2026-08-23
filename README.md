@@ -237,11 +237,22 @@ Your cookie is stored by Music Assistant itself, in the encrypted provider confi
 >
 > The subscribed-shows sync is the one part of this provider that has not been checked against a live account, because doing so needs credentials. If your subscriptions do not appear, or appear wrongly, please say so in [#52](https://github.com/sproft/music-assistant-ytmusic/issues/52) with what you see.
 
+### Finding plain YouTube videos
+
+Track search covers two YouTube Music tabs: the **Songs** tab (the official
+catalog) and the **Videos** tab, which also indexes regular `youtube.com`
+uploads such as live recordings and concert films ([#77]). Catalog songs are
+listed first, videos below them, so keyword search finds a live set that never
+made it into the catalog. Podcast episodes that YouTube mixes into the Videos
+tab are left out; to reach an episode, search for its show under Podcasts and
+open it.
+
+[#77]: https://github.com/sproft/music-assistant-ytmusic/issues/77
+
 ### Adding an arbitrary YouTube link
 
-Music Assistant's global search normally only surfaces YouTube **Music** catalog
-content. To add any specific YouTube or YouTube Music item, including plain
-`youtube.com` videos that aren't in the Music catalog, **paste its URL directly
+Keyword search only finds what YouTube Music's search index chooses to return.
+To add one specific YouTube or YouTube Music item, **paste its URL directly
 into the search box**. The provider detects the link and resolves it to the exact
 item, placed first in the results, that you can then play or add to your library.
 
