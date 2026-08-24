@@ -3781,6 +3781,24 @@ def test_get_artist_unknown_prefix_returns_stub(provider):
     assert artist.item_id == "unknown_Foo Bar"
 
 
+def test_get_artist_bare_unknown_returns_stub_without_ytm_call(provider):
+    """The artist-less placeholder id resolves to a stub instead of raising.
+
+    Music Assistant resolves a track's artist mappings through get_artist when
+    the artist page opens and when a track is added to the library, and treats
+    MediaNotFoundError as "drop the artist" — which errored the artist page and
+    made adding a track whose only artist is the placeholder fail with
+    "Track is missing artist(s)"."""
+    mock = MagicMock()
+    mock.get_artist = MagicMock(side_effect=AssertionError("must not be called"))
+    provider._ytmusic = mock
+    artist = asyncio.run(provider.get_artist("unknown"))
+    assert artist.item_id == "unknown"
+    assert artist.name == "Unknown Artist"
+    assert artist.provider_mappings
+    mock.get_artist.assert_not_called()
+
+
 def test_get_artist_non_channel_id_not_found_without_ytm_call(provider):
     """A non-channel id (e.g. one pulled from track metadata) must not be
     handed to YTM â€” it would return HTTP 400. We raise MediaNotFoundError
