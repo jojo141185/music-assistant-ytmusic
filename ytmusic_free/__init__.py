@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import asyncio
 import importlib
@@ -1645,9 +1645,17 @@ class YoutubeMusicFreeProvider(MusicProvider):
     @use_cache(ARTIST_CACHE_TTL, allow_expired_cache=True)
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
-        # Fake IDs created when artist channel ID is unknown — return a stub
-        if prov_artist_id.startswith("unknown_"):
-            name = prov_artist_id[8:]
+        # Fake IDs created when artist channel ID is unknown — return a stub.
+        # "unknown_<name>" carries a display name; bare "unknown" is the
+        # artist-less placeholder from _minimal_track and the videos-tab search
+        # fallback (issue #77). Music Assistant resolves a track's artist
+        # mappings through this method when the artist page opens and when a
+        # track is added to the library, and it treats MediaNotFoundError as
+        # "drop the artist" — which errors the artist page and, for a track
+        # whose only artist is the placeholder, fails the library add with
+        # "Track is missing artist(s)". So the placeholder must resolve.
+        if prov_artist_id == "unknown" or prov_artist_id.startswith("unknown_"):
+            name = prov_artist_id[8:] or "Unknown Artist"
             return Artist(
                 item_id=prov_artist_id,
                 name=name,
