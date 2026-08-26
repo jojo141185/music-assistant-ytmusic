@@ -1477,6 +1477,131 @@ def test_search_reserves_window_space_for_videos(provider):
     assert [t.item_id for t in results.tracks] == ["s0", "s1", "s2", "v0"]
 
 
+def _catalog_song(i, title="Song"):
+    return {
+        "resultType": "song",
+        "videoId": f"s{i}",
+        "title": f"{title} {i}",
+        "artists": [{"id": "UCart", "name": "A"}],
+    }
+
+
+def _ugc_video(video_id, title):
+    return {
+        "resultType": "video",
+        "videoId": video_id,
+        "title": title,
+        "videoType": "MUSIC_VIDEO_TYPE_UGC",
+        "artists": [{"id": None, "name": "Some Channel"}],
+    }
+
+
+def test_search_promotes_video_matching_query_better_than_songs(provider):
+    """The recording issue #77 is about, reproduced end to end.
+
+    Ranking every video behind the songs hides it: Music Assistant merges the
+    per-provider results into one capped window, so with a second provider
+    enabled only the head of this list is ever seen. A video that covers the
+    whole query while the catalog only fuzzy-matches two of its words has to
+    come first."""
+    by_filter = {
+        "songs": [
+            {
+                "resultType": "song",
+                "videoId": "s0",
+                "title": "7 Seconds",
+                "artists": [{"id": "UCart", "name": "Youssou N'Dour"}],
+            },
+            *[_catalog_song(i) for i in range(1, 8)],
+        ],
+        "videos": [
+            _ugc_video(
+                "0pquBdxfsXY",
+                "PORRIDGE RADIO - 7 SECONDS. Live in Madrid (19-3-25). Sala Copernico Live.",
+            )
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(
+        provider.search("porridge radio 7 seconds madrid", [MediaType.TRACK], limit=4)
+    )
+    ids = [t.item_id for t in results.tracks]
+    assert ids[0] == "0pquBdxfsXY"
+    # the catalog still fills the rest of the window, it is only outranked
+    assert ids == ["0pquBdxfsXY", "s0", "s1", "s2"]
+
+
+def test_search_keeps_weakly_matching_videos_below_songs(provider):
+    """Promotion is the exception. A video that matches the query no better
+    than the catalog does stays below the songs, which is where it belongs for
+    the ordinary case of the catalog holding the recording the user meant."""
+    by_filter = {
+        "songs": [_catalog_song(i, title="Catalog Song") for i in range(8)],
+        "videos": [_ugc_video("v0", "Catalog Song 0 (Live in Madrid)")],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("catalog song 0", [MediaType.TRACK], limit=4))
+    assert [t.item_id for t in results.tracks] == ["s0", "s1", "s2", "v0"]
+
+
+def test_search_promoted_videos_never_evict_every_song(provider):
+    """Promotion may only take the window slots the songs were not going to
+    use. A query where every video outranks the catalog must not turn a music
+    search into a wall of YouTube uploads."""
+    by_filter = {
+        "songs": [_catalog_song(i) for i in range(8)],
+        "videos": [_ugc_video(f"v{i}", f"Live in Madrid {i}") for i in range(5)],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("live in madrid", [MediaType.TRACK], limit=4))
+    ids = [t.item_id for t in results.tracks]
+    assert ids[0] == "v0"
+    assert ids[1:] == ["s0", "s1", "s2"]
+
+
+def test_search_does_not_reorder_videos_when_no_songs_match(provider):
+    """With no songs to outrank there is nothing to promote past, so the crude
+    token score never gets to second-guess the order YTM returned."""
+    by_filter = {
+        "songs": [],
+        "videos": [
+            _ugc_video("v0", "Something Unrelated"),
+            _ugc_video("v1", "Live in Madrid"),
+        ],
+    }
+    mock = MagicMock()
+    mock.search = MagicMock(side_effect=lambda query, filter, limit: by_filter.get(filter, []))
+    provider._ytmusic = mock
+    results = asyncio.run(provider.search("live in madrid", [MediaType.TRACK], limit=4))
+    assert [t.item_id for t in results.tracks] == ["v0", "v1"]
+
+
+def test_split_promoted_videos_requires_a_clear_margin(provider):
+    """A video only outranks the songs when it covers the query substantially
+    better, so a video that ties the best song keeps its place behind it."""
+    songs = [provider._parse_track(_catalog_song(0, title="Live in Madrid"))]
+    tie = provider._parse_track(_ugc_video("tie", "Live in Madrid"))
+    better = provider._parse_track(_ugc_video("better", "Live in Madrid 0 Full Concert"))
+    promoted, weaker = provider._split_promoted_videos("live in madrid 0", songs, [tie, better])
+    assert [t.item_id for t in promoted] == []
+    assert [t.item_id for t in weaker] == ["tie", "better"]
+
+
+def test_query_match_score_treats_punctuation_as_separators(provider):
+    """Upload titles are full of dashes and dots; they must not stop the words
+    the user typed from matching."""
+    track = provider._parse_track(_ugc_video("v0", "7 SECONDS. Live in Madrid (19-3-25)."))
+    assert ytm._query_match_score({"madrid", "19"}, track) == 1.0
+    assert ytm._query_match_score({"madrid", "berlin"}, track) == 0.5
+    assert ytm._query_match_score(set(), track) == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Search by pasted URL
 # ---------------------------------------------------------------------------

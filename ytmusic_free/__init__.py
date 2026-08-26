@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import asyncio
 import importlib
@@ -251,6 +251,15 @@ SEARCH_FILTER_VIDEOS = "videos"
 # forced to "video" by the filter); those belong to the podcast domain, not in
 # track results.
 VIDEO_TYPE_PODCAST_EPISODE = "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"
+
+# How much better a video has to match the query than the best catalog song
+# before it is ranked ahead of the songs, as a fraction of the query's tokens.
+# Videos are ranked below songs by default, but Music Assistant shares one
+# capped result window between every enabled provider, so a tail-ranked video
+# is invisible as soon as the user has a second provider (issue #77). A video
+# that covers substantially more of the query than any song does is what the
+# user was searching for, so it has to survive that cut.
+VIDEO_PROMOTION_MARGIN = 0.25
 
 # Podcast episode ids carry their show with them: "<podcastId>|<videoId>". Music
 # Assistant looks an episode up on its own, without the show for context, and
@@ -670,6 +679,32 @@ def _description_text(value: Any) -> str | None:
 def _normalize_artist_name(value: str) -> str:
     """Fold an artist name to a form two spellings of it can both match."""
     return " ".join(str(value).split()).casefold()
+
+
+def _search_tokens(value: str) -> set[str]:
+    """Split text into comparable tokens for query matching.
+
+    Punctuation is a separator rather than part of a token, so the dashes and
+    dots a YouTube upload title is full of ("7 SECONDS. Live in Madrid
+    (19-3-25)") do not stop its words from matching a plain typed query.
+    """
+    return {token for token in re.split(r"\W+", value.casefold()) if token}
+
+
+def _query_match_score(query_tokens: set[str], track: Track) -> float:
+    """How much of the query a track's title, version and artists cover, 0..1.
+
+    Deliberately crude: it only measures how many of the words the user typed
+    appear somewhere in the track, which is enough to tell a recording the
+    query names outright from a fuzzy catalog match on one or two of its words.
+    It is never used to rank results that YouTube Music already ordered against
+    each other, only to decide whether a video beats the songs (issue #77).
+    """
+    if not query_tokens:
+        return 0.0
+    parts = [track.name, track.version, *(artist.name for artist in track.artists)]
+    track_tokens = _search_tokens(" ".join(part for part in parts if part))
+    return len(query_tokens & track_tokens) / len(query_tokens)
 
 
 def _parse_blocklist(raw: str) -> tuple[frozenset[str], frozenset[str]]:
@@ -1364,12 +1399,59 @@ class YoutubeMusicFreeProvider(MusicProvider):
         # The reservation shrinks to what the videos pass actually returned,
         # so songs only give up window space when there is a video to show.
         reserve = min(len(video_tracks), max(1, limit // 4))
+        songs_shown = song_tracks[: max(0, limit - reserve)]
+        promoted, weaker = self._split_promoted_videos(search_query, song_tracks, video_tracks)
+        # Promoted videos go in front of the songs, but must not evict them:
+        # only the slots the songs were not going to use are theirs. Anything
+        # over that stays ahead of the weaker videos and behind the songs,
+        # which is where it would have ranked before.
+        front_slots = max(0, limit - len(songs_shown))
         parsed_results.tracks = (
-            song_tracks[: max(0, limit - reserve)] + video_tracks
+            promoted[:front_slots] + songs_shown + promoted[front_slots:] + weaker
         )[:limit]
 
         await self._attach_album_years(parsed_results.tracks)
         return parsed_results
+
+    @staticmethod
+    def _split_promoted_videos(
+        search_query: str,
+        song_tracks: list[Track],
+        video_tracks: list[Track],
+    ) -> tuple[list[Track], list[Track]]:
+        """Split the videos pass into the ones that outrank the songs and the rest.
+
+        Videos belong below catalog songs: for most queries the catalog holds
+        the recording the user meant, and the videos tab offers a live cover of
+        it. The exception is a query the catalog simply does not have, where the
+        video is the answer and ranking it last hides it (issue #77) — Music
+        Assistant slices the merged per-provider results to one shared window,
+        so with a second provider enabled only the head of this list is seen.
+
+        A video is promoted when it covers the query at least
+        ``VIDEO_PROMOTION_MARGIN`` better than *every* song did, which is the
+        strict reading of "clearly better" on purpose: a catalog song that
+        matches the query as well as the video keeps its place in front.
+
+        Order within each group is left as YouTube Music returned it, and no
+        split is made when there are no songs to outrank, so a crude token
+        score never gets to re-order results that YTM already ranked.
+        """
+        if not song_tracks or not video_tracks:
+            return [], video_tracks
+        query_tokens = _search_tokens(search_query)
+        if not query_tokens:
+            return [], video_tracks
+        threshold = (
+            max(_query_match_score(query_tokens, song) for song in song_tracks)
+            + VIDEO_PROMOTION_MARGIN
+        )
+        promoted: list[Track] = []
+        weaker: list[Track] = []
+        for video in video_tracks:
+            target = promoted if _query_match_score(query_tokens, video) >= threshold else weaker
+            target.append(video)
+        return promoted, weaker
 
     @classmethod
     def _parse_youtube_url(cls, query: str) -> tuple[str, str] | None:
