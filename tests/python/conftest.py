@@ -130,6 +130,7 @@ def _install_music_assistant_models() -> None:
         LIBRARY_ARTISTS_EDIT = "library_artists_edit"
         LIBRARY_ALBUMS_EDIT = "library_albums_edit"
         LIBRARY_PLAYLISTS_EDIT = "library_playlists_edit"
+        LIBRARY_TRACKS_EDIT = "library_tracks_edit"
 
     class _StreamType(str, Enum):
         HTTP = "http"

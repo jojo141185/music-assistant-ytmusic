@@ -3900,6 +3900,95 @@ def test_get_playlist_tracks_skips_unavailable_tracks(provider):
     assert [track.item_id for track in tracks] == ["available"]
 
 
+# ---------------------------------------------------------------------------
+# Private playlists (issue #82): the yt-dlp fallback can never read them
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("playlist_id", ["LM", "VLLM", "SE", "RDPN"])
+def test_is_private_playlist_id_true(playlist_id):
+    assert ytm._is_private_playlist_id(playlist_id)
+
+
+@pytest.mark.parametrize("playlist_id", ["PLxxx123", "VLPLxxx123", "RDdQw4w9WgXcQ", "OLAK5uy_abc"])
+def test_is_private_playlist_id_false(playlist_id):
+    assert not ytm._is_private_playlist_id(playlist_id)
+
+
+def test_get_playlist_tracks_lm_undercount_never_runs_ytdlp(provider):
+    """YouTube's reported count for LM includes unavailable entries, so the
+    undercount test is chronically true there. The fill-the-gap fallback must
+    not run: unauthenticated yt-dlp cannot see a private playlist and only
+    logs a misleading "playlist does not exist" (issue #82)."""
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(
+        return_value={
+            "trackCount": 5,
+            "tracks": [
+                {
+                    "videoId": "liked_1",
+                    "title": "First",
+                    "artists": [{"id": "UC1", "name": "A"}],
+                },
+                {
+                    "videoId": "liked_2",
+                    "title": "Second",
+                    "artists": [{"id": "UC1", "name": "A"}],
+                },
+            ],
+        }
+    )
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_tracks_via_ytdlp = fallback
+
+    tracks = asyncio.run(provider.get_playlist_tracks("LM"))
+
+    assert [track.item_id for track in tracks] == ["liked_1", "liked_2"]
+
+
+def test_get_playlist_tracks_lm_failure_raises_instead_of_going_empty(provider):
+    """When the authenticated read of a private playlist fails there is no
+    working fallback. Raising keeps the cache decorator from storing an empty
+    listing over the last good one; returning [] here is what made a removed
+    like look like a wiped playlist (issue #82)."""
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(side_effect=RuntimeError("HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_tracks_via_ytdlp = fallback
+
+    with pytest.raises(RuntimeError, match="401"):
+        asyncio.run(provider.get_playlist_tracks("LM"))
+
+
+def test_get_playlist_tracks_non_private_failure_still_falls_back(provider):
+    """The yt-dlp degradation stays in place for ordinary playlist ids."""
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(side_effect=RuntimeError("boom"))
+    provider._ytmusic = mock
+
+    async def _fallback(playlist_id, seed_video_id=None):
+        return [provider._minimal_track("dlp_1")]
+
+    provider._get_playlist_tracks_via_ytdlp = _fallback
+
+    tracks = asyncio.run(provider.get_playlist_tracks("PLbroken"))
+
+    assert [track.item_id for track in tracks] == ["dlp_1"]
+
+
+def test_get_playlist_lm_failure_raises_media_not_found(provider):
+    mock = MagicMock()
+    mock.get_playlist = MagicMock(side_effect=RuntimeError("HTTP 401: Unauthorized"))
+    provider._ytmusic = mock
+    fallback = MagicMock(side_effect=AssertionError("yt-dlp fallback should not run"))
+    provider._get_playlist_via_ytdlp = fallback
+
+    with pytest.raises(MediaNotFoundError):
+        asyncio.run(provider.get_playlist("LM"))
+
+
 def test_get_artist_unknown_prefix_returns_stub(provider):
     artist = asyncio.run(provider.get_artist("unknown_Foo Bar"))
     assert artist.name == "Foo Bar"
@@ -4127,6 +4216,58 @@ def test_library_remove_403_on_artist_is_not_swallowed(provider):
         provider, RuntimeError("Server returned HTTP 403: Forbidden.")
     )
     assert asyncio.run(provider.library_remove("UCsome", MediaType.ARTIST)) is False
+
+
+# ---------------------------------------------------------------------------
+# library_add / library_remove for tracks — like / un-like the song (issue #82)
+# ---------------------------------------------------------------------------
+
+
+def test_library_tracks_edit_feature_declared():
+    assert ProviderFeature.LIBRARY_TRACKS_EDIT in ytm.AUTHENTICATED_FEATURES
+
+
+def _make_authed_provider_with_rate_song(provider):
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.rate_song = MagicMock(return_value=None)
+    provider._ytmusic = mock
+    return mock
+
+
+def test_library_add_track_likes_the_song(provider):
+    mock = _make_authed_provider_with_rate_song(provider)
+    item = _make_item(MediaType.TRACK, "vid12345678")
+    assert asyncio.run(provider.library_add(item)) is True
+    mock.rate_song.assert_called_once_with("vid12345678", "LIKE")
+
+
+def test_library_remove_track_unlikes_the_song(provider):
+    """Deleting a liked track has to remove the like on YouTube too, or the
+    next sync imports it right back (issue #82)."""
+    mock = _make_authed_provider_with_rate_song(provider)
+    assert asyncio.run(provider.library_remove("vid12345678", MediaType.TRACK)) is True
+    mock.rate_song.assert_called_once_with("vid12345678", "INDIFFERENT")
+
+
+def test_library_track_edit_strips_trim_window(provider):
+    """Only the bare video id means anything to the rating endpoint."""
+    mock = _make_authed_provider_with_rate_song(provider)
+    assert (
+        asyncio.run(provider.library_remove("vid12345678@30-90", MediaType.TRACK))
+        is True
+    )
+    mock.rate_song.assert_called_once_with("vid12345678", "INDIFFERENT")
+
+
+def test_library_remove_track_error_returns_false(provider):
+    provider._authenticated = True
+    mock = MagicMock()
+    mock.rate_song = MagicMock(
+        side_effect=RuntimeError("Server returned HTTP 500: Internal Server Error.")
+    )
+    provider._ytmusic = mock
+    assert asyncio.run(provider.library_remove("vid12345678", MediaType.TRACK)) is False
 
 
 # ---------------------------------------------------------------------------
