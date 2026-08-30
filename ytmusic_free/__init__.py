@@ -24,7 +24,7 @@ from __future__ import annotations
 # never reach an install. And Music Assistant would throw it away anyway:
 # ProviderManifest has no version field and mashumaro drops unknown keys, so the
 # manifest object handed to the provider never carries one. See issue #68.
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 import asyncio
 import importlib
@@ -222,6 +222,10 @@ AUTHENTICATED_FEATURES = {
     ProviderFeature.LIBRARY_ARTISTS_EDIT,
     ProviderFeature.LIBRARY_ALBUMS_EDIT,
     ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
+    # A YTM "library track" is a liked song, so add/remove map to rating the
+    # song. Without this a delete only touched Music Assistant's database and
+    # the next sync re-imported the like (issue #82).
+    ProviderFeature.LIBRARY_TRACKS_EDIT,
     # Subscribed shows. Safe to declare unconditionally alongside the others
     # only because get_library_podcasts goes through the same guards as every
     # other library method: without auth it raises rather than reporting an
@@ -288,6 +292,12 @@ LIBRARY_PODCAST_LIMIT = 9999
 # permanent pseudo-subscriptions there that the user cannot remove. The official
 # ytmusic provider skips them for the same reason.
 PERSONAL_PODCAST_PLAYLIST_IDS = frozenset({"RDPN", "SE"})
+
+# Playlists that exist only inside a signed-in account: liked songs ("LM") and
+# the auto-generated podcast lists above. The yt-dlp fallback runs without
+# cookies, so for these it can never return anything; YouTube answers "The
+# playlist does not exist", which reads like data loss in the log (issue #82).
+PRIVATE_PLAYLIST_IDS = frozenset({"LM"}) | PERSONAL_PODCAST_PLAYLIST_IDS
 
 # Shows and episodes change far more slowly than a mix does: a new episode
 # appears weekly at best, and the description and artwork essentially never
@@ -519,6 +529,16 @@ def _format_trim_label(start: int | None, end: int | None) -> str:
 def _strip_browse_prefix(playlist_id: str) -> str:
     """Drop ytmusicapi's "VL" browse prefix (e.g. "VLPLxxx" -> "PLxxx")."""
     return playlist_id[2:] if playlist_id.startswith("VL") else playlist_id
+
+
+def _is_private_playlist_id(playlist_id: str) -> bool:
+    """Is this a per-account playlist that only an authenticated call can read?
+
+    See ``PRIVATE_PLAYLIST_IDS``. For these the unauthenticated yt-dlp
+    fallback is guaranteed to fail, so callers skip it rather than log a
+    misleading "playlist does not exist" for a playlist that plainly exists.
+    """
+    return _strip_browse_prefix(playlist_id) in PRIVATE_PLAYLIST_IDS
 
 
 def _is_radio_playlist_id(playlist_id: str) -> bool:
@@ -1903,6 +1923,21 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except MediaNotFoundError:
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
+            if _is_private_playlist_id(prov_playlist_id):
+                # No fallback exists for a private playlist, so this is the
+                # only place the real error can surface. At debug level all a
+                # user ever saw was yt-dlp's misleading "playlist does not
+                # exist" (issue #82).
+                self.logger.warning(
+                    "could not read private playlist %s with the authenticated "
+                    "session (%s: %s)",
+                    prov_playlist_id,
+                    type(err).__name__,
+                    err,
+                )
+                raise MediaNotFoundError(
+                    f"Playlist {prov_playlist_id} not found"
+                ) from err
             # ytmusicapi requires auth for some playlist types, and raises a
             # KeyError outright on song radio, so fall back to yt-dlp.
             self.logger.debug(
@@ -2054,8 +2089,14 @@ class YoutubeMusicFreeProvider(MusicProvider):
                         track.position = index
                         result.append(track)
             expected_count = self._parse_playlist_track_count(playlist_obj)
-            if not tracks_raw or (
-                expected_count is not None and len(tracks_raw) < expected_count
+            # Private playlists never take the fill-the-gap fallback: yt-dlp
+            # cannot see them, and the undercount test is chronically true for
+            # "LM" because YouTube's reported count includes unavailable
+            # entries, so every liked-songs fetch warned about a "missing"
+            # playlist that was read just fine (issue #82).
+            if not _is_private_playlist_id(prov_playlist_id) and (
+                not tracks_raw
+                or (expected_count is not None and len(tracks_raw) < expected_count)
             ):
                 # A radio id cannot be opened without a seed video. When we
                 # already parsed a track, hand its id over so the fallback has
@@ -2071,6 +2112,22 @@ class YoutubeMusicFreeProvider(MusicProvider):
         except (MediaNotFoundError, UnplayableMediaError):
             raise
         except Exception as err:  # noqa: BLE001 - degrade to the yt-dlp fallback
+            if _is_private_playlist_id(prov_playlist_id):
+                # yt-dlp cannot read a private playlist, so degrading would
+                # return an empty list, and the cache decorator would then
+                # store that emptiness over the last good listing. Re-raise
+                # instead: nothing is cached on an exception, so the
+                # stale-while-revalidate cache keeps serving the previous
+                # listing, and the real error reaches the log at a level the
+                # user can see (issue #82).
+                self.logger.warning(
+                    "could not read private playlist %s with the authenticated "
+                    "session (%s: %s)",
+                    prov_playlist_id,
+                    type(err).__name__,
+                    err,
+                )
+                raise
             # ytmusicapi requires auth for some playlist types, and raises a
             # KeyError outright on song radio, so a fallback here is expected.
             # Include the error: without it this line cannot tell an
@@ -2833,6 +2890,11 @@ class YoutubeMusicFreeProvider(MusicProvider):
                 await asyncio.to_thread(self._ytmusic.subscribe_artists, [item_id])
             elif item.media_type in (MediaType.ALBUM, MediaType.PLAYLIST):
                 await asyncio.to_thread(self._ytmusic.rate_playlist, item_id, "LIKE")
+            elif item.media_type == MediaType.TRACK:
+                # A library track is a liked song. The id may carry a trim
+                # window ("VIDEOID@start-end"); only the bare video id rates.
+                video_id, _, _ = _split_track_id(item_id)
+                await asyncio.to_thread(self._ytmusic.rate_song, video_id, "LIKE")
             else:
                 return False
             return True
@@ -2859,6 +2921,13 @@ class YoutubeMusicFreeProvider(MusicProvider):
             elif media_type in (MediaType.ALBUM, MediaType.PLAYLIST):
                 await asyncio.to_thread(
                     self._ytmusic.rate_playlist, prov_item_id, "INDIFFERENT"
+                )
+            elif media_type == MediaType.TRACK:
+                # Un-rate the song so the delete also removes the like on
+                # YouTube; otherwise the next sync re-imports it (issue #82).
+                video_id, _, _ = _split_track_id(prov_item_id)
+                await asyncio.to_thread(
+                    self._ytmusic.rate_song, video_id, "INDIFFERENT"
                 )
             else:
                 return False
