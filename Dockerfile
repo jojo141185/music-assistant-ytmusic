@@ -3,8 +3,8 @@ ARG MA_VERSION=latest
 FROM ghcr.io/music-assistant/server:${MA_VERSION}
 
 # Add OCI labels for basic image introspection
-LABEL org.opencontainers.image.source="https://github.com/sproft/music-assistant-ytmusic" \
-      org.opencontainers.image.description="Music Assistant Server with pre-installed ytmusic_free provider"
+LABEL org.opencontainers.image.source="https://github.com/sproft/ytmusic-free-provider" \
+      org.opencontainers.image.description="Unofficial build of the upstream server image with the ytmusic_free YouTube Music provider pre-installed. Independent community project, not affiliated with or endorsed by the upstream project."
 
 # Copy the provider directory from the repository context into the image
 COPY ytmusic_free/ /tmp/ytmusic_free/
