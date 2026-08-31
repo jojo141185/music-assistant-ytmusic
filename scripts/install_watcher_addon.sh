@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the MA Provider Watcher add-on for the ytmusic_free provider.
+# Install the Provider Watcher add-on for the ytmusic_free provider.
 #
 # Portable across HAOS (BusyBox ash) and Supervised installs. Uses curl + tar
 # instead of git so it runs on HAOS, where git is not available.
@@ -13,9 +13,9 @@
 set -eu
 
 REPO_OWNER="sproft"
-REPO_NAME="music-assistant-ytmusic"
+REPO_NAME="ytmusic-free-provider"
 ADDON_SLUG="ma_provider_watcher"
-ADDON_NAME="MA Provider Watcher"
+ADDON_NAME="Provider Watcher"
 # The add-on's own version line, deliberately NOT the provider's.
 #
 # It cannot track the provider version, because it has to be strictly greater
@@ -327,7 +327,7 @@ done
 log "Writing config.yaml"
 cat > "$ADDON_DIR/config.yaml" <<EOF
 name: "$ADDON_NAME"
-description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart. Bundles provider $PROVIDER_VERSION (from $REF)."
+description: "Re-installs the ytmusic_free provider into the media server after every container restart. Bundles provider $PROVIDER_VERSION (from $REF)."
 version: "$ADDON_VERSION"
 slug: $ADDON_SLUG
 init: false
@@ -355,11 +355,11 @@ configuration:
     name: Keep the ytmusic_free provider up to date
     description: >-
       Off by default. When enabled, periodically check GitHub for a newer
-      ytmusic_free provider and reinstall it (restarting Music Assistant) only
+      ytmusic_free provider and reinstall it (restarting the server) only
       when the code actually changed. Note this downloads and runs branch-head
-      code inside Music Assistant unattended. This is NOT the add-on's own "Auto
+      code inside the server unattended. This is NOT the add-on's own "Auto
       update" control on the Info tab, which updates the watcher add-on itself;
-      this option updates the music provider inside Music Assistant.
+      this option updates the music provider inside the server.
   update_interval_hours:
     name: Check the provider for updates every (hours)
     description: >-
@@ -399,7 +399,7 @@ log "Writing watcher_lib.sh"
 # HASHFILE / TARBALL_URL first.
 cat > "$ADDON_DIR/watcher_lib.sh" <<'LIBEOF'
 #!/usr/bin/env bash
-# Helpers for the MA Provider Watcher. Source this, then call read_options.
+# Helpers for the Provider Watcher. Source this, then call read_options.
 
 # read_options [options.json path] -> sets AUTO_UPDATE, UPDATE_INTERVAL_HOURS, UPDATE_INTERVAL.
 # Boolean is parsed WITHOUT jq's `//` (which coerces an explicit false to the
@@ -514,7 +514,7 @@ MISSING_GRACE_SECONDS=60
 . /watcher_lib.sh
 read_options
 
-echo "[\$(date)] MA Provider Watcher starting..."
+echo "[\$(date)] Provider Watcher starting..."
 echo "[\$(date)] Add-on $ADDON_VERSION, bundling provider \$BUNDLED_VERSION from $REF"
 echo "[\$(date)] Watching for container name: \$MA"
 

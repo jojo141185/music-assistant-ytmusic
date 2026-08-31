@@ -23,7 +23,7 @@
 set -eu
 
 REPO_OWNER="sproft"
-REPO_NAME="music-assistant-ytmusic"
+REPO_NAME="ytmusic-free-provider"
 PROVIDER_DIR="ytmusic_free"
 
 # Empty means "resolve the newest published release". --ref overrides it with a
@@ -93,7 +93,7 @@ Two ways to proceed:
   A) Install the 'Advanced SSH & Web Terminal' community add-on, set its
      'Protection mode' to OFF, restart it, then re-run this one-liner there.
   B) Skip Docker in your shell: run install_watcher_addon.sh instead, then
-     install and start the 'MA Provider Watcher' local add-on (Protection mode
+     install and start the 'Provider Watcher' local add-on (Protection mode
      OFF). It injects the provider for you and also survives HA restarts.
 
 See the README 'Installation' section for the full walkthrough."

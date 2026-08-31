@@ -35,8 +35,8 @@ Optionally, the watcher can also keep the provider **up to date**: enable `auto_
 ## config.yaml
 
 ```yaml
-name: "MA Provider Watcher"
-description: "Re-installs the ytmusic_free provider into Music Assistant after every container restart."
+name: "Provider Watcher"
+description: "Re-installs the ytmusic_free provider into the media server after every container restart."
 version: "2.0.0"  # the installer stamps a fresh "2.0.0.<timestamp>" on each run so HA detects the change
 slug: ma_provider_watcher
 init: false
@@ -65,9 +65,9 @@ configuration:
     name: Keep the ytmusic_free provider up to date
     description: >-
       Off by default. When enabled, periodically check GitHub for a newer
-      ytmusic_free provider and reinstall it (restarting Music Assistant) only
+      ytmusic_free provider and reinstall it (restarting the server) only
       when the code actually changed. Note this downloads and runs branch-head
-      code inside Music Assistant unattended. This is NOT the add-on's own "Auto
+      code inside the server unattended. This is NOT the add-on's own "Auto
       update" control on the Info tab, which updates the watcher add-on itself;
       this option updates the music provider.
   update_interval_hours:
@@ -119,7 +119,7 @@ MA="app_d5369777_music_assistant"
 SRC="/provider/ytmusic_free"
 DST="/app/venv/lib/python3.13/site-packages/music_assistant/providers"
 
-echo "[$(date)] MA Provider Watcher starting..."
+echo "[$(date)] Provider Watcher starting..."
 
 if ! docker info > /dev/null 2>&1; then
     echo "[$(date)] ERROR: No Docker socket (is Protection Mode off?)"
@@ -164,7 +164,7 @@ done
 > ```
 > The `run.sh` the installer generates re-detects this at runtime and adapts if the name it was given is not there, which is what stops a future rename silently disabling the watcher (issue #54). The minimal `run.sh` above does not, so if you hand-write it, keep the `MA=` line correct yourself.
 
-> **Note:** The `python3.13` in `DST=` tracks MA's Python version, which changes over time (recent Music Assistant builds use `python3.14`). The installer auto-detects it; if you edit `run.sh` by hand, set it to match.
+> **Note:** The `python3.13` in `DST=` tracks MA's Python version, which changes over time (recent server builds use `python3.14`). The installer auto-detects it; if you edit `run.sh` by hand, set it to match.
 > Check with: `docker exec "$MA" ls /app/venv/lib/`
 
 > **Note:** The `run.sh` above is the minimal core (re-inject after container recreation). The `run.sh` that the installer generates additionally implements [Auto-update](#auto-update): it reads `auto_update`/`update_interval_hours` from `/data/options.json`, fetches the latest provider tarball into a `/data` cache, and reinstalls only when the SHA-256 changes.
@@ -176,7 +176,7 @@ done
 For most users the [`scripts/install_watcher_addon.sh`](scripts/install_watcher_addon.sh) installer handles steps 1-3 below automatically:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sproft/ytmusic-free-provider/main/scripts/install_watcher_addon.sh | sh
 ```
 
 The script is POSIX `sh` (works on HAOS BusyBox `ash`), uses `curl + tar` instead of `git`, auto-detects the local add-ons path (HAOS `apps/local` and legacy `addons/local`, Supervised, and the in-add-on `/addons` mapping), and tries to detect the MA container ID and Python venv version. After it finishes, jump to [step 4 (Install the add-on)](#4-install-the-add-on) below.
@@ -196,7 +196,7 @@ Run `sh install_watcher_addon.sh --help` to see all options.
 > **Passing flags through `curl | sh`:** if you re-run the one-liner with a flag, use `sh -s --` as a separator so the flag goes to the script and not to `sh` itself:
 >
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/sproft/music-assistant-ytmusic/main/scripts/install_watcher_addon.sh | sh -s -- --force
+> curl -fsSL https://raw.githubusercontent.com/sproft/ytmusic-free-provider/main/scripts/install_watcher_addon.sh | sh -s -- --force
 > ```
 >
 > `curl ... | sh --force` parses `--force` as a shell option and fails with `sh: bad option '--force'`.
@@ -246,7 +246,7 @@ Create `config.yaml`, `build.yaml`, `Dockerfile`, and `run.sh` as shown above.
 <a id="4-install-the-add-on"></a>
 ### 4. Install the add-on
 
-In Home Assistant: **Settings → Add-ons → Add-on Store** (three-dot menu) → **Check for updates**. The **MA Provider Watcher** appears under **Local add-ons**. Click → **Install**.
+In Home Assistant: **Settings → Add-ons → Add-on Store** (three-dot menu) → **Check for updates**. The **Provider Watcher** appears under **Local add-ons**. Click → **Install**.
 
 ### 5. Disable Protection Mode
 
